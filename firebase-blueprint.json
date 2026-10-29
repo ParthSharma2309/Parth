@@ -1,0 +1,151 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User account profile and preferences",
+      "type": "object",
+      "properties": {
+        "displayName": { "type": "string", "maxLength": 100 },
+        "email": { "type": "string", "format": "email", "maxLength": 255 },
+        "photoURL": { "type": "string", "maxLength": 1024 },
+        "createdAt": { "type": "string" },
+        "lastLoginAt": { "type": "string" },
+        "plan": { "type": "string", "enum": ["free", "pro", "enterprise"] },
+        "settings": { "type": "object" }
+      },
+      "required": ["email", "createdAt"]
+    },
+    "LoginHistory": {
+      "title": "LoginHistory",
+      "description": "Audit log of login events per user",
+      "type": "object",
+      "properties": {
+        "at": { "type": "string" },
+        "method": { "type": "string", "enum": ["password", "google", "guest"] },
+        "userAgent": { "type": "string", "maxLength": 512 },
+        "platform": { "type": "string", "maxLength": 100 },
+        "success": { "type": "boolean" }
+      },
+      "required": ["at", "method", "success"]
+    },
+    "DocumentRecord": {
+      "title": "DocumentRecord",
+      "description": "Metadata for an uploaded research document",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "maxLength": 255 },
+        "pages": { "type": "integer" },
+        "size": { "type": "integer" },
+        "hash": { "type": "string", "maxLength": 128 },
+        "status": { "type": "string", "enum": ["indexing", "ready", "error"] },
+        "summary": { "type": "string", "maxLength": 5000 },
+        "topics": { "type": "array" },
+        "storagePath": { "type": "string", "maxLength": 512 },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["name", "pages", "size", "status", "createdAt"]
+    },
+    "DocumentChunk": {
+      "title": "DocumentChunk",
+      "description": "Indexed passage chunk with embeddings",
+      "type": "object",
+      "properties": {
+        "documentId": { "type": "string", "maxLength": 128 },
+        "page": { "type": "integer" },
+        "text": { "type": "string", "maxLength": 10000 },
+        "model": { "type": "string", "maxLength": 128 },
+        "dim": { "type": "integer" },
+        "embedding": { "type": "array" }
+      },
+      "required": ["documentId", "page", "text", "model"]
+    },
+    "Conversation": {
+      "title": "Conversation",
+      "description": "Research chat thread session",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string", "maxLength": 255 },
+        "scope": { "type": "object" },
+        "pinned": { "type": "boolean" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["title", "createdAt", "updatedAt"]
+    },
+    "ConversationMessage": {
+      "title": "ConversationMessage",
+      "description": "Single message inside a conversation with verified citations",
+      "type": "object",
+      "properties": {
+        "role": { "type": "string", "enum": ["user", "assistant", "system"] },
+        "content": { "type": "string", "maxLength": 50000 },
+        "citations": { "type": "array" },
+        "timings": { "type": "object" },
+        "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
+        "model": { "type": "string", "maxLength": 128 },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["role", "content", "createdAt"]
+    },
+    "NotebookItem": {
+      "title": "NotebookItem",
+      "description": "Annotated research note or synthesis snippet",
+      "type": "object",
+      "properties": {
+        "content": { "type": "string", "maxLength": 20000 },
+        "sourceMessageId": { "type": "string", "maxLength": 128 },
+        "tags": { "type": "array" },
+        "color": { "type": "string", "maxLength": 32 },
+        "position": { "type": "integer" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["content", "createdAt"]
+    },
+    "EvaluationRun": {
+      "title": "EvaluationRun",
+      "description": "Citation accuracy and answer quality evaluation benchmark record",
+      "type": "object",
+      "properties": {
+        "scores": { "type": "object" },
+        "items": { "type": "array" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["scores", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{uid}": {
+      "schema": "UserProfile",
+      "description": "Root user profile document"
+    },
+    "/users/{uid}/loginHistory/{id}": {
+      "schema": "LoginHistory",
+      "description": "User login audit history"
+    },
+    "/users/{uid}/documents/{docId}": {
+      "schema": "DocumentRecord",
+      "description": "Indexed user research documents"
+    },
+    "/users/{uid}/chunks/{chunkId}": {
+      "schema": "DocumentChunk",
+      "description": "Indexed document text chunks and vector embeddings"
+    },
+    "/users/{uid}/conversations/{id}": {
+      "schema": "Conversation",
+      "description": "User research chat threads"
+    },
+    "/users/{uid}/conversations/{id}/messages/{msgId}": {
+      "schema": "ConversationMessage",
+      "description": "Conversation message entries with citations"
+    },
+    "/users/{uid}/notebook/{noteId}": {
+      "schema": "NotebookItem",
+      "description": "User synthesized notes and citations"
+    },
+    "/users/{uid}/evaluations/{runId}": {
+      "schema": "EvaluationRun",
+      "description": "Benchmark evaluation runs"
+    }
+  }
+}

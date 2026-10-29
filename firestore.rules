@@ -1,0 +1,195 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Safety Net: Default-deny all access unless explicitly granted
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper functions
+    function isSignedIn() {
+      return request.auth != null && request.auth.uid != null;
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    // User Profile Validation
+    function isValidUserProfile(data) {
+      return data.keys().hasAll(['email', 'createdAt']) &&
+        data.email is string && data.email.size() <= 255 &&
+        data.createdAt is string &&
+        (!('displayName' in data) || (data.displayName is string && data.displayName.size() <= 100)) &&
+        (!('photoURL' in data) || (data.photoURL is string && data.photoURL.size() <= 1024)) &&
+        (!('plan' in data) || (data.plan in ['free', 'pro', 'enterprise'])) &&
+        (!('settings' in data) || data.settings is map);
+    }
+
+    // Document Record Validation
+    function isValidDocumentRecord(data) {
+      return data.keys().hasAll(['name', 'pages', 'size', 'status', 'createdAt']) &&
+        data.name is string && data.name.size() > 0 && data.name.size() <= 255 &&
+        data.pages is int && data.pages >= 0 &&
+        data.size is int && data.size >= 0 && data.size <= 50000000 &&
+        data.status in ['indexing', 'ready', 'error'] &&
+        data.createdAt is string &&
+        (!('ownerId' in data) || (data.ownerId is string && data.ownerId.size() <= 128)) &&
+        (!('hash' in data) || (data.hash is string && data.hash.size() <= 128)) &&
+        (!('summary' in data) || (data.summary is string && data.summary.size() <= 5000)) &&
+        (!('storagePath' in data) || (data.storagePath is string && data.storagePath.size() <= 512)) &&
+        (!('topics' in data) || (data.topics is list && data.topics.size() <= 50));
+    }
+
+    // Chunk Validation
+    function isValidChunk(data) {
+      return data.keys().hasAll(['documentId', 'page', 'text', 'model']) &&
+        data.documentId is string && data.documentId.size() <= 128 &&
+        data.page is int && data.page >= 0 &&
+        data.text is string && data.text.size() > 0 && data.text.size() <= 10000 &&
+        data.model is string && data.model.size() <= 128 &&
+        (!('dim' in data) || data.dim is int) &&
+        (!('embedding' in data) || (data.embedding is list && data.embedding.size() <= 4096));
+    }
+
+    // Conversation Validation
+    function isValidConversation(data) {
+      return data.keys().hasAll(['title', 'createdAt', 'updatedAt']) &&
+        data.title is string && data.title.size() > 0 && data.title.size() <= 255 &&
+        data.createdAt is string &&
+        data.updatedAt is string &&
+        (!('pinned' in data) || data.pinned is bool) &&
+        (!('scope' in data) || data.scope is map);
+    }
+
+    // Message Validation
+    function isValidMessage(data) {
+      return data.keys().hasAll(['role', 'content', 'createdAt']) &&
+        data.role in ['user', 'assistant', 'system'] &&
+        data.content is string && data.content.size() <= 50000 &&
+        data.createdAt is string &&
+        (!('confidence' in data) || data.confidence in ['high', 'medium', 'low']) &&
+        (!('model' in data) || (data.model is string && data.model.size() <= 128)) &&
+        (!('citations' in data) || (data.citations is list && data.citations.size() <= 100)) &&
+        (!('timings' in data) || data.timings is map);
+    }
+
+    // Notebook Note Validation
+    function isValidNotebookItem(data) {
+      return data.keys().hasAll(['content', 'createdAt']) &&
+        data.content is string && data.content.size() <= 20000 &&
+        data.createdAt is string &&
+        (!('sourceMessageId' in data) || (data.sourceMessageId is string && data.sourceMessageId.size() <= 128)) &&
+        (!('color' in data) || (data.color is string && data.color.size() <= 32)) &&
+        (!('position' in data) || data.position is int) &&
+        (!('tags' in data) || (data.tags is list && data.tags.size() <= 30));
+    }
+
+    // Evaluation Run Validation
+    function isValidEvaluationRun(data) {
+      return data.keys().hasAll(['scores', 'createdAt']) &&
+        data.scores is map &&
+        data.createdAt is string &&
+        (!('items' in data) || (data.items is list && data.items.size() <= 100));
+    }
+
+    // Login History Validation
+    function isValidLoginHistory(data) {
+      return data.keys().hasAll(['at', 'method', 'success']) &&
+        data.at is string &&
+        data.method in ['password', 'google', 'guest'] &&
+        data.success is bool &&
+        (!('userAgent' in data) || (data.userAgent is string && data.userAgent.size() <= 512)) &&
+        (!('platform' in data) || (data.platform is string && data.platform.size() <= 100));
+    }
+
+    // --------------------------------------------------------------------------
+    // USER DATA ISOLATION (users/{uid}/**)
+    // --------------------------------------------------------------------------
+    match /users/{uid} {
+      allow read: if isOwner(uid);
+      allow create: if isOwner(uid) && isValidUserProfile(incoming()) &&
+        (!('plan' in incoming()) || incoming().plan == 'free') &&
+        (!('role' in incoming()) || incoming().role == 'user');
+      allow update: if isOwner(uid) && isValidUserProfile(incoming()) &&
+        (!('plan' in incoming()) || incoming().plan == existing().plan) &&
+        (!('role' in incoming()) || incoming().role == existing().role);
+      allow delete: if isOwner(uid);
+
+      // Audit Login History
+      match /loginHistory/{id} {
+        allow read: if isOwner(uid);
+        allow create: if isOwner(uid) && isValidId(id) && isValidLoginHistory(incoming());
+        allow update, delete: if false; // Append-only audit log
+      }
+
+      // User Research Documents (Strict per-user isolation)
+      match /documents/{docId} {
+        allow read: if isOwner(uid);
+        allow create: if isOwner(uid) && isValidId(docId) && isValidDocumentRecord(incoming()) &&
+          (!('ownerId' in incoming()) || incoming().ownerId == uid) &&
+          (!('storagePath' in incoming()) || incoming().storagePath.matches('^' + uid + '/.*'));
+        allow update: if isOwner(uid) && isValidId(docId) && isValidDocumentRecord(incoming()) &&
+          incoming().createdAt == existing().createdAt &&
+          (!('ownerId' in existing()) || incoming().ownerId == existing().ownerId) &&
+          (!('storagePath' in existing()) || incoming().storagePath == existing().storagePath) &&
+          (!('size' in existing()) || incoming().size == existing().size) &&
+          (!('hash' in existing()) || incoming().hash == existing().hash);
+        allow delete: if isOwner(uid) && isValidId(docId);
+      }
+
+      // Indexed Chunks & Vector Embeddings
+      match /chunks/{chunkId} {
+        allow read: if isOwner(uid);
+        allow create, update: if isOwner(uid) && isValidId(chunkId) && isValidChunk(incoming());
+        allow delete: if isOwner(uid) && isValidId(chunkId);
+      }
+
+      // Conversations
+      match /conversations/{convId} {
+        allow read: if isOwner(uid);
+        allow create: if isOwner(uid) && isValidId(convId) && isValidConversation(incoming());
+        allow update: if isOwner(uid) && isValidId(convId) && isValidConversation(incoming()) &&
+          incoming().createdAt == existing().createdAt;
+        allow delete: if isOwner(uid) && isValidId(convId);
+
+        // Conversation Messages
+        match /messages/{msgId} {
+          allow read: if isOwner(uid);
+          allow create: if isOwner(uid) && isValidId(msgId) && isValidMessage(incoming());
+          allow update: if isOwner(uid) && isValidId(msgId) && isValidMessage(incoming()) &&
+            incoming().createdAt == existing().createdAt;
+          allow delete: if isOwner(uid) && isValidId(msgId);
+        }
+      }
+
+      // Notebook Notes
+      match /notebook/{noteId} {
+        allow read: if isOwner(uid);
+        allow create: if isOwner(uid) && isValidId(noteId) && isValidNotebookItem(incoming());
+        allow update: if isOwner(uid) && isValidId(noteId) && isValidNotebookItem(incoming()) &&
+          incoming().createdAt == existing().createdAt;
+        allow delete: if isOwner(uid) && isValidId(noteId);
+      }
+
+      // Evaluations
+      match /evaluations/{runId} {
+        allow read: if isOwner(uid);
+        allow create, update: if isOwner(uid) && isValidId(runId) && isValidEvaluationRun(incoming());
+        allow delete: if isOwner(uid) && isValidId(runId);
+      }
+    }
+  }
+}
