@@ -1,7 +1,23 @@
+import fs from 'fs';
+import path from 'path';
 import dotenv from 'dotenv';
 import { z } from 'zod';
 
 dotenv.config();
+
+function getAppletConfigProjectId(): string | undefined {
+  if (process.env.FIREBASE_DISABLE_APPLET_CONFIG === 'true') {
+    return undefined;
+  }
+  try {
+    const configPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
+    if (fs.existsSync(configPath)) {
+      const cfg = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+      if (cfg?.projectId) return String(cfg.projectId).trim();
+    }
+  } catch {}
+  return undefined;
+}
 
 function getCliArg(flag: string): string | undefined {
   const idx = process.argv.indexOf(flag);
@@ -66,6 +82,7 @@ const rawEnv = {
   FIREBASE_PROJECT_ID:
     process.env.FIREBASE_PROJECT_ID?.trim() ||
     process.env.VITE_FIREBASE_PROJECT_ID?.trim() ||
+    getAppletConfigProjectId() ||
     undefined,
   FIREBASE_SERVICE_ACCOUNT: process.env.FIREBASE_SERVICE_ACCOUNT?.trim() || undefined,
   FIREBASE_CLIENT_EMAIL: process.env.FIREBASE_CLIENT_EMAIL?.trim() || undefined,

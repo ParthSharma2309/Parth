@@ -425,15 +425,18 @@ display:flex;flex-direction:column;gap:10px}
 }
 
 /* Document Library Flip Card & Grid */
-.doc-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+.doc-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;opacity:1!important;visibility:visible!important}
 @media(max-width:859px){
   .doc-grid{grid-template-columns:1fr}
 }
-.fl{perspective:900px;height:230px}
-.fi{position:relative;height:100%;transition:transform .7s cubic-bezier(.2,.8,.2,1);transform-style:preserve-3d}
-.fl:hover .fi, .fl.flipped .fi{transform:rotateY(180deg)}
-.ff,.fb{position:absolute;inset:0;backface-visibility:hidden;-webkit-backface-visibility:hidden;padding:22px;display:flex;flex-direction:column;overflow:hidden}
-.fb{transform:rotateY(180deg);background:var(--card);box-shadow:var(--sh)}
+.fl{perspective:1000px;-webkit-perspective:1000px;height:230px;cursor:pointer;-webkit-tap-highlight-color:transparent;opacity:1!important;visibility:visible!important}
+.fi{position:relative;width:100%;height:100%;transition:transform .6s cubic-bezier(.2,.8,.2,1);transform-style:preserve-3d;-webkit-transform-style:preserve-3d}
+.fl.flipped .fi{transform:rotateY(180deg);-webkit-transform:rotateY(180deg)}
+.ff,.fb{position:absolute;inset:0;width:100%;height:100%;backface-visibility:hidden;-webkit-backface-visibility:hidden;transform-style:preserve-3d;-webkit-transform-style:preserve-3d;padding:22px;display:flex;flex-direction:column;box-sizing:border-box}
+.ff{transform:rotateY(0deg) translateZ(1px);-webkit-transform:rotateY(0deg) translateZ(1px);overflow:hidden;pointer-events:auto}
+.fb{transform:rotateY(180deg) translateZ(1px);-webkit-transform:rotateY(180deg) translateZ(1px);background:var(--card);box-shadow:var(--sh);pointer-events:none}
+.fl.flipped .ff{pointer-events:none}
+.fl.flipped .fb{pointer-events:auto}
 
 /* Dashboard 6-column Bento Grid */
 .bento-6{display:grid;grid-template-columns:repeat(6,1fr);gap:14px}

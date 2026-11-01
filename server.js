@@ -1,16 +1,32 @@
 // server/index.ts
 import express2 from "express";
-import path2 from "path";
-import fs from "fs";
+import path4 from "path";
+import fs3 from "fs";
 import { fileURLToPath } from "url";
 import helmet from "helmet";
 import compression from "compression";
 import cors from "cors";
 
 // server/lib/env.ts
+import fs from "fs";
+import path from "path";
 import dotenv from "dotenv";
 import { z } from "zod";
 dotenv.config();
+function getAppletConfigProjectId() {
+  if (process.env.FIREBASE_DISABLE_APPLET_CONFIG === "true") {
+    return void 0;
+  }
+  try {
+    const configPath = path.resolve(process.cwd(), "firebase-applet-config.json");
+    if (fs.existsSync(configPath)) {
+      const cfg = JSON.parse(fs.readFileSync(configPath, "utf8"));
+      if (cfg?.projectId) return String(cfg.projectId).trim();
+    }
+  } catch {
+  }
+  return void 0;
+}
 function getCliArg(flag) {
   const idx = process.argv.indexOf(flag);
   return idx !== -1 && idx + 1 < process.argv.length ? process.argv[idx + 1] : void 0;
@@ -61,7 +77,7 @@ var rawEnv = {
   TIMEOUT_VISION: parseOptionalIntWithFallback(process.env.TIMEOUT_VISION, 9e4),
   LOG_LEVEL: (process.env.LOG_LEVEL || "info").toLowerCase(),
   EMBED_DIMENSIONS: parseOptionalPositiveInt(process.env.EMBED_DIMENSIONS),
-  FIREBASE_PROJECT_ID: process.env.FIREBASE_PROJECT_ID?.trim() || process.env.VITE_FIREBASE_PROJECT_ID?.trim() || void 0,
+  FIREBASE_PROJECT_ID: process.env.FIREBASE_PROJECT_ID?.trim() || process.env.VITE_FIREBASE_PROJECT_ID?.trim() || getAppletConfigProjectId() || void 0,
   FIREBASE_SERVICE_ACCOUNT: process.env.FIREBASE_SERVICE_ACCOUNT?.trim() || void 0,
   FIREBASE_CLIENT_EMAIL: process.env.FIREBASE_CLIENT_EMAIL?.trim() || void 0,
   FIREBASE_PRIVATE_KEY: process.env.FIREBASE_PRIVATE_KEY?.trim() || void 0,
@@ -567,7 +583,7 @@ function createRequestAbortController(req, res, timeoutMs) {
   };
 }
 async function generateWithFallback(options) {
-  const { models, build, signal, requestId, maxRetriesPerModel = 2 } = options;
+  const { models, build, signal, requestId, maxRetriesPerModel = 2, perModelTimeoutMs = 25e3 } = options;
   if (!models || models.length === 0) {
     throw new AppError(500, "No models provided to generateWithFallback", "NO_MODELS");
   }
@@ -604,8 +620,37 @@ async function generateWithFallback(options) {
         },
         `Attempting generation with model ${currentModel}`
       );
+      const attemptController = new AbortController();
+      let attemptTimedOut = false;
+      const attemptTimer = setTimeout(() => {
+        attemptTimedOut = true;
+        attemptController.abort(new Error("ETIMEDOUT: Model call exceeded attempt timeout"));
+      }, perModelTimeoutMs);
+      attemptTimer.unref();
+      const onParentAbort = () => {
+        attemptController.abort(signal?.reason || new Error("CLIENT_CLOSED"));
+      };
+      if (signal) {
+        signal.addEventListener("abort", onParentAbort, { once: true });
+      }
       try {
-        const response = await build(currentModel);
+        const buildPromise = build(currentModel, attemptController.signal);
+        const timeoutPromise = new Promise((_, reject) => {
+          attemptController.signal.addEventListener(
+            "abort",
+            () => {
+              if (attemptTimedOut) {
+                reject(new Error("ETIMEDOUT: Model call exceeded attempt timeout"));
+              }
+            },
+            { once: true }
+          );
+        });
+        const response = await Promise.race([buildPromise, timeoutPromise]);
+        clearTimeout(attemptTimer);
+        if (signal) {
+          signal.removeEventListener("abort", onParentAbort);
+        }
         recordModelSuccess(currentModel);
         logger.info(
           { requestId, model: currentModel, attempts: totalAttempts },
@@ -617,6 +662,17 @@ async function generateWithFallback(options) {
           attempts: totalAttempts
         };
       } catch (err) {
+        clearTimeout(attemptTimer);
+        if (signal) {
+          signal.removeEventListener("abort", onParentAbort);
+        }
+        if (signal?.aborted) {
+          throw new AppError(
+            504,
+            "Gateway timeout (504): The request took longer than expected to process. Please retry.",
+            "timeout"
+          );
+        }
         lastError = err;
         const errType = classifyError(err);
         recordModelFailure(currentModel, requestId);
@@ -641,10 +697,23 @@ async function generateWithFallback(options) {
         if (errType === "quota") {
           const delayMs = parseRetryDelayMs(err) || 6e4;
           setModelCooldown(currentModel, delayMs);
-          logger.warn(
+          logger.info(
             { requestId, model: currentModel, cooldownMs: delayMs },
             `Quota limit reached for model ${currentModel}, cooldown set`
           );
+        } else if (errType === "unavailable" || errType === "timeout") {
+          setModelCooldown(currentModel, 6e4);
+          logger.info(
+            { requestId, model: currentModel, errType },
+            `Model ${currentModel} is ${errType}, setting 60s cooldown`
+          );
+        }
+        if (!isLastModel && (errType === "unavailable" || errType === "timeout")) {
+          logger.info(
+            { requestId, failedModel: currentModel, errType, nextModel: candidateModels[mIdx + 1] },
+            `Model ${currentModel} is ${errType}, immediately falling through to fallback model ${candidateModels[mIdx + 1]}`
+          );
+          break;
         }
         if (modelAttempt < maxRetriesPerModel && !signal?.aborted) {
           const jitter = Math.floor(Math.random() * 250);
@@ -657,7 +726,7 @@ async function generateWithFallback(options) {
           continue;
         }
         if (!isLastModel) {
-          logger.warn(
+          logger.info(
             { requestId, failedModel: currentModel, errType, nextModel: candidateModels[mIdx + 1] },
             `Model ${currentModel} exhausted retries, falling through to fallback model`
           );
@@ -952,7 +1021,7 @@ Format your output clearly:
         models: getVisionModelCandidates(),
         signal,
         requestId,
-        build: async (targetModel) => {
+        build: async (targetModel, attemptSignal) => {
           const ai = getAI(env.TIMEOUT_VISION);
           return await ai.models.generateContent({
             model: targetModel,
@@ -971,7 +1040,7 @@ Format your output clearly:
             },
             config: {
               temperature: 0.1,
-              abortSignal: signal
+              abortSignal: attemptSignal || signal
             }
           });
         }
@@ -992,10 +1061,12 @@ Format your output clearly:
 // server/routes/upload.ts
 import { Router as Router3 } from "express";
 import multer from "multer";
-import path from "path";
+import path3 from "path";
 import crypto2 from "crypto";
 
 // server/lib/firebaseAdmin.ts
+import fs2 from "fs";
+import path2 from "path";
 import { getApps, initializeApp, cert } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import { getFirestore } from "firebase-admin/firestore";
@@ -1009,6 +1080,19 @@ var AuthNotConfiguredError = class _AuthNotConfiguredError extends Error {
 var adminAuth = null;
 var adminFirestore = null;
 var appInstance = null;
+function loadAppletConfig() {
+  if (process.env.FIREBASE_DISABLE_APPLET_CONFIG === "true") {
+    return null;
+  }
+  try {
+    const configPath = path2.resolve(process.cwd(), "firebase-applet-config.json");
+    if (fs2.existsSync(configPath)) {
+      return JSON.parse(fs2.readFileSync(configPath, "utf8"));
+    }
+  } catch {
+  }
+  return null;
+}
 function parseServiceAccount() {
   const raw = process.env.FIREBASE_SERVICE_ACCOUNT?.trim();
   if (raw) {
@@ -1047,6 +1131,10 @@ function resolveProjectId(serviceAccount) {
   }
   if (serviceAccount && typeof serviceAccount.project_id === "string" && serviceAccount.project_id.trim()) {
     return serviceAccount.project_id.trim();
+  }
+  const appletCfg = loadAppletConfig();
+  if (appletCfg?.projectId) {
+    return appletCfg.projectId;
   }
   return void 0;
 }
@@ -1094,7 +1182,9 @@ function getAdminFirestore() {
   getAdminAuth();
   if (!appInstance) return null;
   try {
-    adminFirestore = getFirestore(appInstance);
+    const appletCfg = loadAppletConfig();
+    const dbId = process.env.FIREBASE_DATABASE_ID || appletCfg?.firestoreDatabaseId;
+    adminFirestore = dbId ? getFirestore(appInstance, dbId) : getFirestore(appInstance);
     return adminFirestore;
   } catch (err) {
     logger.warn({ err: err.message }, "Failed to initialize Firebase Admin Firestore");
@@ -1276,7 +1366,7 @@ function sanitizeFilename(originalName) {
   if (!originalName || typeof originalName !== "string") {
     return "document.pdf";
   }
-  const base = path.basename(originalName);
+  const base = path3.basename(originalName);
   const sanitized = base.replace(/[^a-zA-Z0-9._\-\s()]/g, "_").trim().slice(0, 255);
   return sanitized || "document.pdf";
 }
@@ -1317,7 +1407,7 @@ uploadRouter.post(
           });
         }
         const file = req.file;
-        const ext = path.extname(file.originalname).toLowerCase();
+        const ext = path3.extname(file.originalname).toLowerCase();
         if (ext !== ".pdf") {
           return res.status(400).json({
             error: "Invalid file type. Only PDF documents (.pdf) are supported.",
@@ -1693,15 +1783,15 @@ documentsRouter.delete(
       }
       const existingData = docSnap.data();
       if (existingData.ownerId && existingData.ownerId !== uid) {
-        return res.status(403).json({
-          error: "Access denied: you do not have permission to delete this document.",
-          code: "FORBIDDEN",
+        return res.status(404).json({
+          error: "Document not found.",
+          code: "NOT_FOUND",
           requestId
         });
       }
-      const storagePath = existingData.storagePath;
+      const storagePath = existingData.storagePath || `${uid}/${docId}.pdf`;
       if (storagePath && isSupabaseConfigured()) {
-        if (typeof storagePath === "string" && storagePath.startsWith(`${uid}/`)) {
+        if (typeof storagePath === "string" && !storagePath.includes("..") && (storagePath.startsWith(`${uid}/`) || storagePath.startsWith(`users/${uid}/`))) {
           try {
             const supabase = getSupabaseAdminClient();
             await supabase.storage.from(getSupabaseBucket()).remove([storagePath]);
@@ -1723,9 +1813,13 @@ documentsRouter.delete(
       try {
         const chunksSnap = await adminFirestore2.collection(`users/${uid}/chunks`).where("documentId", "==", docId).get();
         if (!chunksSnap.empty) {
-          const batch = adminFirestore2.batch();
-          chunksSnap.docs.forEach((d) => batch.delete(d.ref));
-          await batch.commit();
+          const batchSize = 400;
+          for (let i = 0; i < chunksSnap.docs.length; i += batchSize) {
+            const batch = adminFirestore2.batch();
+            const chunkSlice = chunksSnap.docs.slice(i, i + batchSize);
+            chunkSlice.forEach((d) => batch.delete(d.ref));
+            await batch.commit();
+          }
           logger.info({ docId, uid, chunkCount: chunksSnap.size }, "Removed document chunks from Firestore");
         }
       } catch (chunkDelErr) {
@@ -2277,7 +2371,7 @@ Security & Grounding Directives:
       models: getGenerationModelCandidates(model),
       signal,
       requestId,
-      build: async (targetModel) => {
+      build: async (targetModel, attemptSignal) => {
         const ai = getAI(env.TIMEOUT_GENERATE);
         return await ai.models.generateContent({
           model: targetModel,
@@ -2322,7 +2416,7 @@ Security & Grounding Directives:
               },
               required: ["answerable", "answer", "citations"]
             },
-            abortSignal: signal
+            abortSignal: attemptSignal || signal
           }
         });
       }
@@ -2414,7 +2508,7 @@ Always use inline citations like [1], [2] to reference the supporting passages.`
       models: getGenerationModelCandidates(model),
       signal,
       requestId,
-      build: async (targetModel) => {
+      build: async (targetModel, attemptSignal) => {
         const ai = getAI(env.TIMEOUT_GENERATE);
         return await ai.models.generateContentStream({
           model: targetModel,
@@ -2422,7 +2516,7 @@ Always use inline citations like [1], [2] to reference the supporting passages.`
           config: {
             systemInstruction,
             temperature: 0.2,
-            abortSignal: signal
+            abortSignal: attemptSignal || signal
           }
         });
       }
@@ -2547,7 +2641,7 @@ Task:
       models: getGenerationModelCandidates(),
       signal,
       requestId,
-      build: async (targetModel) => {
+      build: async (targetModel, attemptSignal) => {
         const ai = getAI(env.TIMEOUT_GENERATE);
         return await ai.models.generateContent({
           model: targetModel,
@@ -2570,7 +2664,7 @@ Task:
               },
               required: ["summary", "suggestedQuestions"]
             },
-            abortSignal: signal
+            abortSignal: attemptSignal || signal
           }
         });
       }
@@ -2616,7 +2710,7 @@ Keep each question under 15 words.`;
       models: getGenerationModelCandidates(),
       signal,
       requestId,
-      build: async (targetModel) => {
+      build: async (targetModel, attemptSignal) => {
         const ai = getAI(env.TIMEOUT_GENERATE);
         return await ai.models.generateContent({
           model: targetModel,
@@ -2635,7 +2729,7 @@ Keep each question under 15 words.`;
               },
               required: ["followups"]
             },
-            abortSignal: signal
+            abortSignal: attemptSignal || signal
           }
         });
       }
@@ -2732,14 +2826,14 @@ Return ONLY the single rewritten question text without commentary or quotation m
         models: candidateModels,
         signal,
         requestId,
-        build: async (targetModel) => {
+        build: async (targetModel, attemptSignal) => {
           const ai = getAI(env.TIMEOUT_REWRITE);
           return await ai.models.generateContent({
             model: targetModel,
             contents: prompt,
             config: {
               temperature: 0.1,
-              abortSignal: signal
+              abortSignal: attemptSignal || signal
             }
           });
         }
@@ -2765,10 +2859,339 @@ Return ONLY the single rewritten question text without commentary or quotation m
   }
 });
 
+// server/routes/conversations.ts
+import { Router as Router8 } from "express";
+var conversationsRouter = Router8();
+var convLimiter = rateLimit({ windowMs: 6e4, max: 120 });
+var VALID_ID_REGEX2 = /^[a-zA-Z0-9_\-]{1,128}$/;
+function isValidId(id) {
+  return typeof id === "string" && VALID_ID_REGEX2.test(id);
+}
+conversationsRouter.get(
+  "/api/conversations",
+  requireUser,
+  convLimiter,
+  async (req, res) => {
+    const requestId = res.getHeader("X-Request-Id") || (req.id ? String(req.id) : "");
+    const uid = req.user.uid;
+    const adminFirestore2 = getAdminFirestore();
+    if (!adminFirestore2) {
+      return res.status(503).json({
+        error: "Database is not configured on this server.",
+        code: "DATABASE_NOT_CONFIGURED",
+        requestId
+      });
+    }
+    try {
+      const snapshot = await adminFirestore2.collection(`users/${uid}/conversations`).orderBy("updatedAt", "desc").get().catch(async () => {
+        return await adminFirestore2.collection(`users/${uid}/conversations`).get();
+      });
+      const conversations = snapshot.docs.map((d) => {
+        const data = d.data();
+        return {
+          id: d.id,
+          title: data.title || "Untitled Inquiry",
+          scope: data.scope || { type: "all" },
+          pinned: Boolean(data.pinned),
+          createdAt: typeof data.createdAt === "string" ? new Date(data.createdAt).getTime() : data.createdAt || Date.now(),
+          updatedAt: typeof data.updatedAt === "string" ? new Date(data.updatedAt).getTime() : data.updatedAt || Date.now(),
+          userId: uid,
+          ownerId: uid
+        };
+      });
+      conversations.sort((a, b) => b.updatedAt - a.updatedAt);
+      return res.status(200).json({
+        success: true,
+        conversations,
+        total: conversations.length,
+        requestId
+      });
+    } catch (err) {
+      logger.error({ err: err.message, uid, requestId }, "Failed to list user conversations");
+      return res.status(500).json({
+        error: "Failed to retrieve conversation history.",
+        code: "INTERNAL_ERROR",
+        requestId
+      });
+    }
+  }
+);
+conversationsRouter.post(
+  "/api/conversations",
+  requireUser,
+  convLimiter,
+  async (req, res) => {
+    const requestId = res.getHeader("X-Request-Id") || (req.id ? String(req.id) : "");
+    const uid = req.user.uid;
+    const adminFirestore2 = getAdminFirestore();
+    if (!adminFirestore2) {
+      return res.status(503).json({
+        error: "Database is not configured on this server.",
+        code: "DATABASE_NOT_CONFIGURED",
+        requestId
+      });
+    }
+    const { id, title, scope, pinned, createdAt, updatedAt } = req.body;
+    const convId = id && isValidId(id) ? id : `conv_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+    if (!isValidId(convId)) {
+      return res.status(400).json({
+        error: "Invalid conversation ID format.",
+        code: "INVALID_ID",
+        requestId
+      });
+    }
+    const cleanTitle = typeof title === "string" && title.trim() ? title.trim().slice(0, 255) : "New Research Inquiry";
+    const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+    const createdIso = createdAt ? new Date(createdAt).toISOString() : nowIso;
+    const updatedIso = updatedAt ? new Date(updatedAt).toISOString() : nowIso;
+    try {
+      const convRef = adminFirestore2.doc(`users/${uid}/conversations/${convId}`);
+      const existingSnap = await convRef.get();
+      const convData = {
+        title: cleanTitle,
+        scope: typeof scope === "object" && scope !== null ? scope : { type: "all" },
+        pinned: Boolean(pinned),
+        createdAt: existingSnap.exists ? existingSnap.data()?.createdAt || createdIso : createdIso,
+        updatedAt: updatedIso,
+        ownerId: uid
+      };
+      await convRef.set(convData, { merge: true });
+      return res.status(200).json({
+        success: true,
+        conversation: {
+          id: convId,
+          ...convData,
+          createdAt: new Date(convData.createdAt).getTime(),
+          updatedAt: new Date(convData.updatedAt).getTime(),
+          userId: uid
+        },
+        requestId
+      });
+    } catch (err) {
+      logger.error({ err: err.message, convId, uid, requestId }, "Failed to save conversation");
+      return res.status(500).json({
+        error: "Failed to persist conversation.",
+        code: "INTERNAL_ERROR",
+        requestId
+      });
+    }
+  }
+);
+conversationsRouter.delete(
+  "/api/conversations/:id",
+  requireUser,
+  convLimiter,
+  async (req, res) => {
+    const requestId = res.getHeader("X-Request-Id") || (req.id ? String(req.id) : "");
+    const uid = req.user.uid;
+    const convId = req.params.id;
+    if (!isValidId(convId)) {
+      return res.status(400).json({
+        error: "Invalid conversation ID format.",
+        code: "INVALID_ID",
+        requestId
+      });
+    }
+    const adminFirestore2 = getAdminFirestore();
+    if (!adminFirestore2) {
+      return res.status(503).json({
+        error: "Database is not configured on this server.",
+        code: "DATABASE_NOT_CONFIGURED",
+        requestId
+      });
+    }
+    try {
+      const convRef = adminFirestore2.doc(`users/${uid}/conversations/${convId}`);
+      const convSnap = await convRef.get();
+      if (!convSnap.exists) {
+        return res.status(200).json({ success: true, message: "Already deleted or absent", requestId });
+      }
+      const messagesSnap = await convRef.collection("messages").get();
+      const batchSize = 450;
+      for (let i = 0; i < messagesSnap.docs.length; i += batchSize) {
+        const batch = adminFirestore2.batch();
+        const slice = messagesSnap.docs.slice(i, i + batchSize);
+        for (const doc of slice) {
+          batch.delete(doc.ref);
+        }
+        await batch.commit();
+      }
+      await convRef.delete();
+      return res.status(200).json({
+        success: true,
+        deletedId: convId,
+        requestId
+      });
+    } catch (err) {
+      logger.error({ err: err.message, convId, uid, requestId }, "Failed to delete conversation");
+      return res.status(500).json({
+        error: "Failed to delete conversation.",
+        code: "INTERNAL_ERROR",
+        requestId
+      });
+    }
+  }
+);
+conversationsRouter.get(
+  "/api/conversations/:id/messages",
+  requireUser,
+  convLimiter,
+  async (req, res) => {
+    const requestId = res.getHeader("X-Request-Id") || (req.id ? String(req.id) : "");
+    const uid = req.user.uid;
+    const convId = req.params.id;
+    if (!isValidId(convId)) {
+      return res.status(400).json({
+        error: "Invalid conversation ID format.",
+        code: "INVALID_ID",
+        requestId
+      });
+    }
+    const adminFirestore2 = getAdminFirestore();
+    if (!adminFirestore2) {
+      return res.status(503).json({
+        error: "Database is not configured on this server.",
+        code: "DATABASE_NOT_CONFIGURED",
+        requestId
+      });
+    }
+    try {
+      const convRef = adminFirestore2.doc(`users/${uid}/conversations/${convId}`);
+      const convSnap = await convRef.get();
+      if (!convSnap.exists) {
+        return res.status(404).json({
+          error: "Conversation not found.",
+          code: "NOT_FOUND",
+          requestId
+        });
+      }
+      const msgsSnap = await convRef.collection("messages").orderBy("createdAt", "asc").get().catch(async () => {
+        return await convRef.collection("messages").get();
+      });
+      const messages = msgsSnap.docs.map((d) => {
+        const data = d.data();
+        const createdAtNum = typeof data.createdAt === "string" ? new Date(data.createdAt).getTime() : data.createdAt || Date.now();
+        return {
+          id: d.id,
+          conversationId: convId,
+          role: data.role || "user",
+          content: data.content || "",
+          citations: Array.isArray(data.citations) ? data.citations : [],
+          latencyMs: data.timings?.total || data.latencyMs || void 0,
+          modelUsed: data.model || "gemini-3.8-flash",
+          status: "answered",
+          createdAt: createdAtNum,
+          retrievalScope: convSnap.data()?.scope
+        };
+      });
+      messages.sort((a, b) => a.createdAt - b.createdAt);
+      return res.status(200).json({
+        success: true,
+        conversationId: convId,
+        messages,
+        total: messages.length,
+        requestId
+      });
+    } catch (err) {
+      logger.error({ err: err.message, convId, uid, requestId }, "Failed to retrieve conversation messages");
+      return res.status(500).json({
+        error: "Failed to retrieve conversation messages.",
+        code: "INTERNAL_ERROR",
+        requestId
+      });
+    }
+  }
+);
+conversationsRouter.post(
+  "/api/conversations/:id/messages",
+  requireUser,
+  convLimiter,
+  async (req, res) => {
+    const requestId = res.getHeader("X-Request-Id") || (req.id ? String(req.id) : "");
+    const uid = req.user.uid;
+    const convId = req.params.id;
+    if (!isValidId(convId)) {
+      return res.status(400).json({
+        error: "Invalid conversation ID format.",
+        code: "INVALID_ID",
+        requestId
+      });
+    }
+    const adminFirestore2 = getAdminFirestore();
+    if (!adminFirestore2) {
+      return res.status(503).json({
+        error: "Database is not configured on this server.",
+        code: "DATABASE_NOT_CONFIGURED",
+        requestId
+      });
+    }
+    const { id, role, content, citations, latencyMs, modelUsed, createdAt } = req.body;
+    const msgId = id && isValidId(id) ? id : `msg_${role || "user"}_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+    if (!content || typeof content !== "string") {
+      return res.status(400).json({
+        error: "Message content is required.",
+        code: "INVALID_CONTENT",
+        requestId
+      });
+    }
+    const cleanRole = role === "assistant" || role === "system" ? role : "user";
+    const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+    const createdIso = createdAt ? new Date(createdAt).toISOString() : nowIso;
+    try {
+      const convRef = adminFirestore2.doc(`users/${uid}/conversations/${convId}`);
+      const convSnap = await convRef.get();
+      if (!convSnap.exists) {
+        await convRef.set({
+          title: content.slice(0, 36) + (content.length > 36 ? "..." : ""),
+          scope: { type: "all" },
+          pinned: false,
+          createdAt: createdIso,
+          updatedAt: nowIso,
+          ownerId: uid
+        });
+      } else {
+        await convRef.set({ updatedAt: nowIso }, { merge: true });
+      }
+      const msgRef = convRef.collection("messages").doc(msgId);
+      const msgData = {
+        role: cleanRole,
+        content: content.slice(0, 5e4),
+        citations: Array.isArray(citations) ? citations.slice(0, 100) : [],
+        timings: typeof latencyMs === "number" ? { total: latencyMs } : {},
+        confidence: "high",
+        model: String(modelUsed || "gemini-3.8-flash").slice(0, 128),
+        createdAt: createdIso
+      };
+      await msgRef.set(msgData, { merge: true });
+      return res.status(200).json({
+        success: true,
+        conversationId: convId,
+        message: {
+          id: msgId,
+          conversationId: convId,
+          ...msgData,
+          createdAt: new Date(msgData.createdAt).getTime(),
+          latencyMs,
+          modelUsed: msgData.model,
+          status: "answered"
+        },
+        requestId
+      });
+    } catch (err) {
+      logger.error({ err: err.message, convId, msgId, uid, requestId }, "Failed to persist conversation message");
+      return res.status(500).json({
+        error: "Failed to persist message.",
+        code: "INTERNAL_ERROR",
+        requestId
+      });
+    }
+  }
+);
+
 // server/index.ts
 var __filename = fileURLToPath(import.meta.url);
-var __dirname = path2.dirname(__filename);
-var rootDir = path2.resolve(__dirname, "..");
+var __dirname = path4.dirname(__filename);
+var rootDir = path4.resolve(__dirname, "..");
 var app = express2();
 app.set("trust proxy", 1);
 app.use(
@@ -2827,6 +3250,7 @@ app.use(uploadRouter);
 app.use(express2.json({ limit: "10mb" }));
 app.use(express2.urlencoded({ limit: "10mb", extended: true }));
 app.use(documentsRouter);
+app.use(conversationsRouter);
 app.use(embedRouter);
 app.use(generateRouter);
 app.use(rewriteRouter);
@@ -2837,10 +3261,10 @@ async function bootstrap() {
     logger.warn({ err: err?.message }, "Async model startup verification finished with error");
   });
   if (env.NODE_ENV === "production") {
-    const distPath = path2.resolve(rootDir, "dist");
+    const distPath = path4.resolve(rootDir, "dist");
     app.use(
       "/assets",
-      express2.static(path2.resolve(distPath, "assets"), {
+      express2.static(path4.resolve(distPath, "assets"), {
         maxAge: "1y",
         immutable: true
       })
@@ -2859,11 +3283,11 @@ async function bootstrap() {
       })
     );
     app.get("*", (_req, res) => {
-      const indexPath = path2.resolve(distPath, "index.html");
+      const indexPath = path4.resolve(distPath, "index.html");
       res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
       res.setHeader("Pragma", "no-cache");
       res.setHeader("Expires", "0");
-      if (fs.existsSync(indexPath)) {
+      if (fs3.existsSync(indexPath)) {
         res.sendFile(indexPath);
       } else {
         res.status(200).send("<!doctype html><html><body><h1>DocuMind</h1><p>Initializing...</p></body></html>");

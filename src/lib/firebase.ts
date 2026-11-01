@@ -2,11 +2,12 @@ import { initializeApp, getApps, getApp, FirebaseApp, FirebaseOptions } from 'fi
 import { getAuth, Auth } from 'firebase/auth';
 import { getFirestore, Firestore } from 'firebase/firestore';
 import { getStorage, FirebaseStorage } from 'firebase/storage';
+import appletConfig from '../../firebase-applet-config.json';
 
 export interface FirebaseConfigStatus {
   isConfigured: boolean;
   missingKeys: string[];
-  config: FirebaseOptions | null;
+  config: (FirebaseOptions & { firestoreDatabaseId?: string }) | null;
 }
 
 export const REQUIRED_FIREBASE_ENV_VARS = [
@@ -21,13 +22,17 @@ export const REQUIRED_FIREBASE_ENV_VARS = [
 export function checkFirebaseConfig(): FirebaseConfigStatus {
   const missingKeys: string[] = [];
 
-  const apiKey = import.meta.env.VITE_FIREBASE_API_KEY;
-  const authDomain = import.meta.env.VITE_FIREBASE_AUTH_DOMAIN;
-  const projectId = import.meta.env.VITE_FIREBASE_PROJECT_ID;
-  const storageBucket = import.meta.env.VITE_FIREBASE_STORAGE_BUCKET;
-  const messagingSenderId = import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID;
-  const appId = import.meta.env.VITE_FIREBASE_APP_ID;
-  const measurementId = import.meta.env.VITE_FIREBASE_MEASUREMENT_ID;
+  const cfg = (appletConfig as any) || {};
+  const viteEnv = (typeof import.meta !== 'undefined' && (import.meta as any).env) || {};
+
+  const apiKey = viteEnv.VITE_FIREBASE_API_KEY || cfg.apiKey;
+  const authDomain = viteEnv.VITE_FIREBASE_AUTH_DOMAIN || cfg.authDomain;
+  const projectId = viteEnv.VITE_FIREBASE_PROJECT_ID || cfg.projectId;
+  const storageBucket = viteEnv.VITE_FIREBASE_STORAGE_BUCKET || cfg.storageBucket;
+  const messagingSenderId = viteEnv.VITE_FIREBASE_MESSAGING_SENDER_ID || cfg.messagingSenderId;
+  const appId = viteEnv.VITE_FIREBASE_APP_ID || cfg.appId;
+  const measurementId = viteEnv.VITE_FIREBASE_MEASUREMENT_ID || cfg.measurementId;
+  const firestoreDatabaseId = cfg.firestoreDatabaseId;
 
   if (!apiKey) missingKeys.push('VITE_FIREBASE_API_KEY');
   if (!authDomain) missingKeys.push('VITE_FIREBASE_AUTH_DOMAIN');
@@ -55,6 +60,7 @@ export function checkFirebaseConfig(): FirebaseConfigStatus {
       messagingSenderId,
       appId,
       measurementId: measurementId || undefined,
+      firestoreDatabaseId: firestoreDatabaseId || undefined,
     },
   };
 }
@@ -70,7 +76,8 @@ if (configStatus.isConfigured && configStatus.config) {
   try {
     app = getApps().length > 0 ? getApp() : initializeApp(configStatus.config);
     auth = getAuth(app);
-    db = getFirestore(app);
+    const dbId = configStatus.config.firestoreDatabaseId;
+    db = dbId ? getFirestore(app, dbId) : getFirestore(app);
     storage = getStorage(app);
   } catch (err) {
     console.warn('Failed to initialize Firebase services:', err);

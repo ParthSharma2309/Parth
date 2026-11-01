@@ -118,7 +118,13 @@ export const MessageItem: React.FC<MessageItemProps> = ({
   // Assistant message logic
   const isAbstain =
     message.status === 'no_relevant_passages' ||
-    message.status === 'insufficient_evidence';
+    message.status === 'insufficient_evidence' ||
+    Boolean(
+      message.content &&
+        (message.content.includes("couldn't find sufficient evidence") ||
+          message.content.toLowerCase().startsWith('no relevant evidence') ||
+          message.content.toLowerCase().startsWith('insufficient evidence'))
+    );
   const isError = message.status === 'error';
   const mismatch = message.indexMismatch;
   const mismatchMatch = (message.errorMessage || message.content || '').match(
@@ -146,17 +152,20 @@ export const MessageItem: React.FC<MessageItemProps> = ({
 
   // Pages read
   const pagesRead = useMemo(() => {
-    const pages = Array.from(new Set(message.citations.map((c) => c.pageNumber))).sort((a, b) => a - b);
+    const validPages = message.citations
+      .map((c) => c.pageNumber)
+      .filter((p): p is number => typeof p === 'number' && !isNaN(p));
+    const pages = Array.from(new Set(validPages)).sort((a, b) => a - b);
     if (pages.length === 0) return 'p.1';
     if (pages.length <= 3) return `p.${pages.join(', ')}`;
     return `p.${pages[0]}-${pages[pages.length - 1]}`;
   }, [message.citations]);
 
-  const numPassages = Math.max(message.citations.length * 2, 4);
+  const numPassages = Math.max(message.citations?.length ? message.citations.length * 2 : 4, 4);
 
   // Confidence calculations
-  const verifiedCount = message.citations.filter((c) => c.verified).length;
-  const totalCit = message.citations.length;
+  const verifiedCount = message.citations ? message.citations.filter((c) => c.verified).length : 0;
+  const totalCit = message.citations?.length || 0;
   const percentage =
     totalCit > 0
       ? Math.round((verifiedCount / totalCit) * 100)
@@ -185,8 +194,8 @@ export const MessageItem: React.FC<MessageItemProps> = ({
 
   return (
     <div className="ai mb-6 text-[var(--ink)]">
-      {/* 1. Status chips row above answer (only for answered messages with evidence) */}
-      {!isError && !isAbstain && (
+      {/* 1. Status chips row above answer (only for answered messages with evidence and real citations) */}
+      {!isError && !isAbstain && message.citations && message.citations.length > 0 && (
         <div className="flex flex-wrap items-center gap-2 mb-3.5">
           {/* Step 1: Searched N passages */}
           <span
@@ -217,12 +226,12 @@ export const MessageItem: React.FC<MessageItemProps> = ({
           <span
             className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[11px] font-bold select-none transition-all"
             style={{
-              background: isStreaming ? 'var(--card-subtle)' : 'var(--lime)',
+              background: isStreaming ? 'var(--card-subtle)' : verifiedCount > 0 ? 'var(--lime)' : 'var(--card-subtle)',
               color: 'var(--ink)',
             }}
           >
-            <span>✓</span>
-            <span>Quotes verified</span>
+            <span>{verifiedCount > 0 ? '✓' : '•'}</span>
+            <span>{verifiedCount > 0 ? `${verifiedCount} quote${verifiedCount > 1 ? 's' : ''} verified` : 'Passages cited'}</span>
           </span>
 
           {message.latencyMs && (

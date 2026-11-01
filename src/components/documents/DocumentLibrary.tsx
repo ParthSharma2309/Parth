@@ -32,6 +32,7 @@ interface DocumentLibraryProps {
   onRefresh: () => void;
   onOpenDocumentInWorkspace: (docId: string) => void;
   onOpenInReadingDesk?: (docId: string) => void;
+  onDeleteDocument?: (docId: string) => void;
 }
 
 export const DocumentLibrary: React.FC<DocumentLibraryProps> = ({
@@ -40,6 +41,7 @@ export const DocumentLibrary: React.FC<DocumentLibraryProps> = ({
   onRefresh,
   onOpenDocumentInWorkspace,
   onOpenInReadingDesk,
+  onDeleteDocument,
 }) => {
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [selectedCollectionFilter, setSelectedCollectionFilter] = useState<string>('all');
@@ -50,6 +52,8 @@ export const DocumentLibrary: React.FC<DocumentLibraryProps> = ({
   const [retryError, setRetryError] = useState<string | null>(null);
   const [flippedId, setFlippedId] = useState<string | null>(null);
   const [downloadingDocId, setDownloadingDocId] = useState<string | null>(null);
+  const [docToDelete, setDocToDelete] = useState<DocumentRecord | null>(null);
+  const [isDeleting, setIsDeleting] = useState<boolean>(false);
   const { showToast } = useToast();
 
   const filteredDocs = documents.filter((doc) => {
@@ -83,49 +87,66 @@ export const DocumentLibrary: React.FC<DocumentLibraryProps> = ({
     }
   };
 
-  const handleDelete = async (doc: DocumentRecord) => {
-    try {
-      const blob = await getDocumentBlob(doc.id);
-      const chunks = await getChunksByDocument(doc.id);
-      await deleteDocument(doc.id);
+  const handleConfirmDelete = async () => {
+    if (!docToDelete || isDeleting) return;
+    setIsDeleting(true);
+    const targetDoc = docToDelete;
 
-      // If registered user, delete from cloud storage & Firestore
+    try {
+      // 1. If authenticated registered user, delete from backend/cloud storage first.
+      // Rejects if offline to avoid partial state or document resurrection on refresh.
       if (auth?.currentUser && !auth.currentUser.isAnonymous) {
-        await deleteCloudDocument(doc.id).catch((err) =>
-          console.warn('Background cloud delete warning:', err)
-        );
+        try {
+          await deleteCloudDocument(targetDoc.id);
+        } catch (cloudErr: any) {
+          // If offline, rethrow to notify user and prevent desync
+          if (cloudErr.message?.toLowerCase().includes('offline')) {
+            throw cloudErr;
+          }
+          // If 404 or document not found on server, document is already absent from cloud; proceed with local deletion
+          if (!cloudErr.message?.toLowerCase().includes('not found') && !cloudErr.message?.includes('404')) {
+            throw cloudErr;
+          }
+        }
       }
 
+      // 2. Delete local document record, raw PDF blob, and all chunks from IndexedDB
+      await deleteDocument(targetDoc.id);
+
+      // 3. Immediately notify parent to remove from active workspace selection
+      onDeleteDocument?.(targetDoc.id);
       onRefresh();
 
+      // 4. Close confirmation dialog and notify user
+      setDocToDelete(null);
       showToast({
-        message: `"${doc.name}" removed from library`,
-        type: 'info',
-        duration: 5000,
-        undoAction: async () => {
-          await saveDocument(doc, blob);
-          if (chunks.length > 0) {
-            await saveChunks(chunks);
-          }
-          onRefresh();
-          showToast({ message: `"${doc.name}" restored!`, type: 'success' });
-        },
+        message: `"${targetDoc.name}" deleted successfully.`,
+        type: 'success',
       });
-    } catch (err) {
-      showToast({ message: 'Failed to delete document', type: 'error' });
+    } catch (err: any) {
+      console.error('Failed to delete document:', err);
+      showToast({
+        message: err.message || `Failed to delete "${targetDoc.name}".`,
+        type: 'error',
+      });
+    } finally {
+      setIsDeleting(false);
     }
   };
 
   const handleRetry = async (doc: DocumentRecord) => {
+    if (retryingDocId === doc.id) return;
     setRetryingDocId(doc.id);
     setRetryError(null);
+    showToast({ message: `Running OCR on "${doc.name}"...`, type: 'info' });
     try {
       await retryProcessDocument(doc.id, (_pct: number, _msg: string) => {});
       onRefresh();
-      showToast({ message: `Running OCR & re-indexing "${doc.name}"`, type: 'info' });
+      showToast({ message: `OCR completed successfully for "${doc.name}".`, type: 'success' });
     } catch (err: any) {
-      setRetryError(`Retry failed: ${err.message || 'Unknown error'}`);
-      showToast({ message: 'Retry failed', type: 'error' });
+      const errorMsg = err.message || 'Unknown error';
+      setRetryError(`Retry failed: ${errorMsg}`);
+      showToast({ message: `OCR failed: ${errorMsg}`, type: 'error' });
     } finally {
       setRetryingDocId(null);
     }
@@ -331,8 +352,28 @@ export const DocumentLibrary: React.FC<DocumentLibraryProps> = ({
             return (
               <div
                 key={doc.id}
-                className={`fl reveal ${flippedId === doc.id ? 'flipped' : ''}`}
-                onClick={() => setFlippedId(flippedId === doc.id ? null : doc.id)}
+                data-testid={`doc-card-${doc.id}`}
+                role="button"
+                tabIndex={0}
+                aria-label={`Document card for ${doc.name}. Press to flip.`}
+                className={`fl cursor-pointer ${flippedId === doc.id ? 'flipped' : ''}`}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    const target = e.target as HTMLElement;
+                    if (target.closest('button') || target.closest('a') || target.closest('[data-no-flip]')) {
+                      return;
+                    }
+                    e.preventDefault();
+                    setFlippedId(flippedId === doc.id ? null : doc.id);
+                  }
+                }}
+                onClick={(e) => {
+                  const target = e.target as HTMLElement;
+                  if (target.closest('button') || target.closest('a') || target.closest('[data-no-flip]')) {
+                    return;
+                  }
+                  setFlippedId(flippedId === doc.id ? null : doc.id);
+                }}
               >
                 <div className="fi">
                   {/* FRONT OF FLIP CARD */}
@@ -358,23 +399,81 @@ export const DocumentLibrary: React.FC<DocumentLibraryProps> = ({
                       }}
                     />
 
-                    {/* Top: Dark pill with page count and Scanned/Needs OCR pill */}
-                    <div className="flex items-center justify-between gap-2 z-10">
-                      <span
-                        className="px-3 py-1 rounded-full font-mono text-[11px] font-bold text-white shadow-xs"
-                        style={{ background: '#17133b' }}
-                      >
-                        {doc.pageCount} {doc.pageCount === 1 ? 'page' : 'pages'}
-                      </span>
-
-                      {needsOCR && (
+                    {/* Top: Dark pill with page count, Needs OCR pill, and Delete button */}
+                    <div className="flex items-center justify-between gap-2 z-10 w-full">
+                      <div className="flex items-center gap-1.5 flex-wrap">
                         <span
-                          className="px-2.5 py-0.5 rounded-full font-mono text-[10.5px] font-bold text-white shadow-xs"
+                          className="px-3 py-1 rounded-full font-mono text-[11px] font-bold text-white shadow-xs"
                           style={{ background: '#17133b' }}
                         >
-                          Needs OCR
+                          {doc.pageCount} {doc.pageCount === 1 ? 'page' : 'pages'}
                         </span>
-                      )}
+
+                        {needsOCR && (
+                          <button
+                            type="button"
+                            data-testid={`run-ocr-front-${doc.id}`}
+                            data-no-flip="true"
+                            onClick={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              handleRetry(doc);
+                            }}
+                            onMouseDown={(e) => e.stopPropagation()}
+                            onPointerDown={(e) => e.stopPropagation()}
+                            onTouchStart={(e) => e.stopPropagation()}
+                            onTouchEnd={(e) => e.stopPropagation()}
+                            disabled={isRetrying}
+                            className="px-2.5 py-0.5 rounded-full font-mono text-[10.5px] font-bold text-white shadow-xs bg-[#17133b] hover:bg-[var(--sun)] hover:text-[#17133b] transition-colors flex items-center gap-1 cursor-pointer disabled:opacity-60"
+                            title="Run Gemini Vision OCR on scanned document"
+                          >
+                            {isRetrying ? (
+                              <>
+                                <Loader2 size={11} className="animate-spin text-[var(--sun)]" />
+                                <span>Running...</span>
+                              </>
+                            ) : (
+                              <>
+                                <ScanText size={11} />
+                                <span>Run OCR</span>
+                              </>
+                            )}
+                          </button>
+                        )}
+                      </div>
+
+                      {/* Dedicated isolated wrapper for front-face delete button */}
+                      <div
+                        data-no-flip="true"
+                        className="relative z-30 inline-flex items-center"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                        }}
+                        onMouseDown={(e) => e.stopPropagation()}
+                        onPointerDown={(e) => e.stopPropagation()}
+                        onTouchStart={(e) => e.stopPropagation()}
+                        onTouchEnd={(e) => e.stopPropagation()}
+                      >
+                        <button
+                          type="button"
+                          data-testid={`delete-btn-front-${doc.id}`}
+                          onClick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            setDocToDelete(doc);
+                          }}
+                          onMouseDown={(e) => e.stopPropagation()}
+                          onPointerDown={(e) => e.stopPropagation()}
+                          onTouchStart={(e) => e.stopPropagation()}
+                          onTouchEnd={(e) => e.stopPropagation()}
+                          className="p-1.5 rounded-full bg-[#17133b]/15 text-[#17133b] hover:bg-[var(--err)] hover:text-white transition-all cursor-pointer shadow-xs shrink-0"
+                          title={`Delete "${doc.name}"`}
+                          aria-label={`Delete ${doc.name}`}
+                        >
+                          <Trash2 size={13} />
+                        </button>
+                      </div>
                     </div>
 
                     {/* Center: Title (24px Bricolage) */}
@@ -395,13 +494,38 @@ export const DocumentLibrary: React.FC<DocumentLibraryProps> = ({
                       </h3>
                     </div>
 
-                    {/* Bottom footer: File size & Flip indicator */}
-                    <div className="flex items-center justify-between z-10 pt-2 text-[11px] font-mono text-[#17133b]/80 border-t border-black/10">
+                    {/* Bottom footer: File size, Open in Reading Desk & Flip indicator */}
+                    <div className="flex items-center justify-between z-10 pt-2 text-[11px] font-mono text-[#17133b]/80 border-t border-black/10 gap-2">
                       <span>{doc.size ? `${Math.round(doc.size / 1024)} KB` : 'PDF'}</span>
-                      <span className="flex items-center gap-1 font-sans font-bold text-[#17133b]">
-                        <span>Flip card</span>
-                        <span>↻</span>
-                      </span>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          data-testid={`open-desk-front-${doc.id}`}
+                          data-no-flip="true"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            if (onOpenInReadingDesk) {
+                              onOpenInReadingDesk(doc.id);
+                            } else {
+                              onOpenDocumentInWorkspace(doc.id);
+                            }
+                          }}
+                          onMouseDown={(e) => e.stopPropagation()}
+                          onPointerDown={(e) => e.stopPropagation()}
+                          onTouchStart={(e) => e.stopPropagation()}
+                          onTouchEnd={(e) => e.stopPropagation()}
+                          className="px-2.5 py-1 rounded-full bg-[#17133b] text-white hover:bg-black font-sans font-bold text-[11px] flex items-center gap-1 cursor-pointer shadow-xs transition-colors"
+                          title="Open in Reading Desk"
+                        >
+                          <BookOpen size={11} />
+                          <span>Reading Desk</span>
+                        </button>
+                        <span className="flex items-center gap-1 font-sans font-bold text-[#17133b] opacity-80">
+                          <span>Flip</span>
+                          <span>↻</span>
+                        </span>
+                      </div>
                     </div>
                   </div>
 
@@ -411,7 +535,6 @@ export const DocumentLibrary: React.FC<DocumentLibraryProps> = ({
                     style={{
                       borderRadius: theme.radius,
                     }}
-                    onClick={(e) => e.stopPropagation()}
                   >
                     <div>
                       {/* Top Header: Doc name and Action buttons (Download & Delete) */}
@@ -423,9 +546,13 @@ export const DocumentLibrary: React.FC<DocumentLibraryProps> = ({
                           <button
                             type="button"
                             onClick={(e) => {
+                              e.preventDefault();
                               e.stopPropagation();
                               handleDownload(doc);
                             }}
+                            onMouseDown={(e) => e.stopPropagation()}
+                            onPointerDown={(e) => e.stopPropagation()}
+                            onTouchStart={(e) => e.stopPropagation()}
                             disabled={downloadingDocId === doc.id}
                             className="p-1 rounded-full text-[var(--mute)] hover:text-[var(--a1)] hover:bg-[color-mix(in_srgb,var(--a1)_12%,transparent)] transition-colors cursor-pointer disabled:opacity-50"
                             title="Download document PDF"
@@ -436,17 +563,39 @@ export const DocumentLibrary: React.FC<DocumentLibraryProps> = ({
                               <Download size={13} />
                             )}
                           </button>
-                          <button
-                            type="button"
+
+                          {/* Dedicated isolated wrapper for back-face delete button */}
+                          <div
+                            data-no-flip="true"
+                            className="relative z-30 inline-flex items-center"
                             onClick={(e) => {
+                              e.preventDefault();
                               e.stopPropagation();
-                              handleDelete(doc);
                             }}
-                            className="p-1 rounded-full text-[var(--mute)] hover:text-[var(--err)] hover:bg-[color-mix(in_srgb,var(--err)_12%,transparent)] transition-colors cursor-pointer"
-                            title="Delete document"
+                            onMouseDown={(e) => e.stopPropagation()}
+                            onPointerDown={(e) => e.stopPropagation()}
+                            onTouchStart={(e) => e.stopPropagation()}
+                            onTouchEnd={(e) => e.stopPropagation()}
                           >
-                            <Trash2 size={13} />
-                          </button>
+                            <button
+                              type="button"
+                              data-testid={`delete-btn-back-${doc.id}`}
+                              onClick={(e) => {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                setDocToDelete(doc);
+                              }}
+                              onMouseDown={(e) => e.stopPropagation()}
+                              onPointerDown={(e) => e.stopPropagation()}
+                              onTouchStart={(e) => e.stopPropagation()}
+                              onTouchEnd={(e) => e.stopPropagation()}
+                              className="p-1 rounded-full text-[var(--mute)] hover:text-[var(--err)] hover:bg-[color-mix(in_srgb,var(--err)_12%,transparent)] transition-colors cursor-pointer"
+                              title={`Delete "${doc.name}"`}
+                              aria-label={`Delete ${doc.name}`}
+                            >
+                              <Trash2 size={13} />
+                            </button>
+                          </div>
                         </div>
                       </div>
 
@@ -481,12 +630,19 @@ export const DocumentLibrary: React.FC<DocumentLibraryProps> = ({
                           </span>
                           <button
                             type="button"
+                            data-testid={`run-ocr-back-${doc.id}`}
+                            data-no-flip="true"
                             onClick={(e) => {
+                              e.preventDefault();
                               e.stopPropagation();
                               handleRetry(doc);
                             }}
+                            onMouseDown={(e) => e.stopPropagation()}
+                            onPointerDown={(e) => e.stopPropagation()}
+                            onTouchStart={(e) => e.stopPropagation()}
+                            onTouchEnd={(e) => e.stopPropagation()}
                             disabled={isRetrying}
-                            className="btn sm !py-1 !px-2.5 text-xs !bg-[var(--sun)] !text-[var(--ink)] shadow-none flex items-center gap-1"
+                            className="btn sm !py-1 !px-2.5 text-xs !bg-[var(--sun)] !text-[var(--ink)] shadow-none flex items-center gap-1 cursor-pointer disabled:opacity-60"
                             title="Run Gemini Vision OCR on scanned document"
                           >
                             {isRetrying ? (
@@ -494,7 +650,7 @@ export const DocumentLibrary: React.FC<DocumentLibraryProps> = ({
                             ) : (
                               <ScanText size={11} />
                             )}
-                            <span>{isRetrying ? 'Running...' : 'Run OCR'}</span>
+                            <span>{isRetrying ? 'Running OCR...' : 'Run OCR'}</span>
                           </button>
                         </div>
                       ) : (
@@ -505,7 +661,10 @@ export const DocumentLibrary: React.FC<DocumentLibraryProps> = ({
 
                       <button
                         type="button"
+                        data-testid={`open-desk-back-${doc.id}`}
+                        data-no-flip="true"
                         onClick={(e) => {
+                          e.preventDefault();
                           e.stopPropagation();
                           if (onOpenInReadingDesk) {
                             onOpenInReadingDesk(doc.id);
@@ -513,6 +672,10 @@ export const DocumentLibrary: React.FC<DocumentLibraryProps> = ({
                             onOpenDocumentInWorkspace(doc.id);
                           }
                         }}
+                        onMouseDown={(e) => e.stopPropagation()}
+                        onPointerDown={(e) => e.stopPropagation()}
+                        onTouchStart={(e) => e.stopPropagation()}
+                        onTouchEnd={(e) => e.stopPropagation()}
                         className="btn sm !py-1.5 !px-3 text-xs flex items-center gap-1.5 ml-auto cursor-pointer"
                         title="Open in Reading Desk"
                       >
@@ -585,6 +748,84 @@ export const DocumentLibrary: React.FC<DocumentLibraryProps> = ({
                 className="btn sm"
               >
                 Create
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Delete Confirmation Dialog */}
+      {docToDelete && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="delete-dialog-title"
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-[3px] animate-in fade-in"
+          onClick={() => {
+            if (!isDeleting) setDocToDelete(null);
+          }}
+        >
+          <div
+            style={{
+              borderRadius: '32px',
+              boxShadow: 'var(--sh)',
+            }}
+            className="bg-[var(--card)] p-6 sm:p-7 border border-[color-mix(in_srgb,var(--mute)_22%,transparent)] max-w-md w-full space-y-4 shadow-2xl animate-in zoom-in-95 text-[var(--ink)]"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-full bg-[var(--err)]/15 text-[var(--err)] flex items-center justify-center shrink-0">
+                <Trash2 size={20} />
+              </div>
+              <div>
+                <h3 id="delete-dialog-title" className="text-lg font-bold text-[var(--ink)]">
+                  Delete Document
+                </h3>
+                <p className="text-xs text-[var(--mute)] font-mono">Permanent Removal</p>
+              </div>
+            </div>
+
+            <div className="text-xs sm:text-sm text-[var(--ink)] space-y-2 leading-relaxed">
+              <p>
+                Are you sure you want to permanently delete{' '}
+                <strong className="font-semibold text-[var(--ink)] break-all">
+                  &ldquo;{docToDelete.name}&rdquo;
+                </strong>
+                ?
+              </p>
+              <p className="text-xs text-[var(--mute)]">
+                This will permanently delete the PDF file, all extracted text passages, citations, and search index entries from both cloud storage and local memory. This action cannot be undone.
+              </p>
+            </div>
+
+            <div className="flex items-center justify-end gap-2.5 pt-3 border-t border-[color-mix(in_srgb,var(--mute)_15%,transparent)]">
+              <button
+                type="button"
+                data-testid="cancel-delete-btn"
+                onClick={() => setDocToDelete(null)}
+                disabled={isDeleting}
+                className="btn outline sm cursor-pointer disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                data-testid="confirm-delete-btn"
+                onClick={handleConfirmDelete}
+                disabled={isDeleting}
+                className="btn sm !bg-[var(--err)] !text-white flex items-center gap-1.5 cursor-pointer disabled:opacity-50 shadow-xs"
+              >
+                {isDeleting ? (
+                  <>
+                    <Loader2 size={13} className="animate-spin" />
+                    <span>Deleting...</span>
+                  </>
+                ) : (
+                  <>
+                    <Trash2 size={13} />
+                    <span>Delete Document</span>
+                  </>
+                )}
               </button>
             </div>
           </div>

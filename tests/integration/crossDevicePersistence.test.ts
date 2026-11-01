@@ -51,26 +51,29 @@ describe('Phase 7: Cross-Device Document Persistence & AI Retrieval Verification
   const firestoreStore = new Map<string, any>();
 
   const createMockFirestore = () => {
-    return {
+    const mockFs: any = {
       collection: (colPath: string) => {
+        const prefix = colPath.endsWith('/') ? colPath : colPath + '/';
         const getDocsMatching = (filters: Array<{ field: string; op: string; val: any }> = []) => {
           const docs: any[] = [];
           for (const [key, value] of firestoreStore.entries()) {
-            if (key.startsWith(colPath + '/')) {
-              const docId = key.slice(colPath.length + 1);
-              let match = true;
-              for (const f of filters) {
-                if (f.op === '==' && value[f.field] !== f.val) {
-                  match = false;
-                  break;
+            if (key.startsWith(prefix)) {
+              const remainder = key.slice(prefix.length);
+              if (!remainder.includes('/')) {
+                let match = true;
+                for (const f of filters) {
+                  if (f.op === '==' && value[f.field] !== f.val) {
+                    match = false;
+                    break;
+                  }
                 }
-              }
-              if (match) {
-                docs.push({
-                  id: docId,
-                  ref: { path: key },
-                  data: () => ({ ...value }),
-                });
+                if (match) {
+                  docs.push({
+                    id: remainder,
+                    ref: { path: key },
+                    data: () => ({ ...value }),
+                  });
+                }
               }
             }
           }
@@ -93,6 +96,7 @@ describe('Phase 7: Cross-Device Document Persistence & AI Retrieval Verification
 
         return {
           ...createQuery(),
+          doc: (docId: string) => mockFs.doc(`${colPath}/${docId}`),
           get: async () => {
             const docs = getDocsMatching();
             return {
@@ -105,6 +109,7 @@ describe('Phase 7: Cross-Device Document Persistence & AI Retrieval Verification
       },
       doc: (docPath: string) => ({
         path: docPath,
+        collection: (subCol: string) => mockFs.collection(`${docPath}/${subCol}`),
         get: async () => {
           const val = firestoreStore.get(docPath);
           const docId = docPath.split('/').pop()!;
@@ -156,6 +161,7 @@ describe('Phase 7: Cross-Device Document Persistence & AI Retrieval Verification
         };
       },
     };
+    return mockFs;
   };
 
   beforeEach(() => {
@@ -426,5 +432,243 @@ describe('Phase 7: Cross-Device Document Persistence & AI Retrieval Verification
     // Verify chunks deleted from Firestore (no orphaned chunk vectors)
     expect(firestoreStore.has('users/valid-user-a/chunks/chunk_alpha_1_1_0')).toBe(false);
     expect(firestoreStore.has('users/valid-user-a/chunks/chunk_alpha_1_2_1')).toBe(false);
+  });
+
+  // 9. POST /api/conversations creates and updates conversation in Firestore
+  it('9. allows authenticated user to create and update conversations in Firestore', async () => {
+    const createRes = await request(app)
+      .post('/api/conversations')
+      .set('Authorization', 'Bearer valid-user-a')
+      .send({
+        id: 'conv_alpha_1',
+        title: 'Quantum Computing Research Thread',
+        scope: { type: 'document', documentId: 'doc_alpha_1' },
+        pinned: true,
+      });
+
+    expect(createRes.status).toBe(200);
+    expect(createRes.body.success).toBe(true);
+    expect(createRes.body.conversation.id).toBe('conv_alpha_1');
+    expect(createRes.body.conversation.title).toBe('Quantum Computing Research Thread');
+    expect(createRes.body.conversation.pinned).toBe(true);
+    expect(createRes.body.conversation.userId).toBe('valid-user-a');
+
+    // Verify stored in users/valid-user-a/conversations/conv_alpha_1
+    const stored = firestoreStore.get('users/valid-user-a/conversations/conv_alpha_1');
+    expect(stored).toBeDefined();
+    expect(stored.title).toBe('Quantum Computing Research Thread');
+    expect(stored.ownerId).toBe('valid-user-a');
+  });
+
+  // 10. GET /api/conversations retrieves user conversations
+  it('10. allows authenticated user to list their conversations across devices', async () => {
+    // Seed two conversations for User A
+    firestoreStore.set('users/valid-user-a/conversations/conv_1', {
+      title: 'Thread 1',
+      scope: { type: 'all' },
+      pinned: false,
+      createdAt: '2026-10-23T10:00:00.000Z',
+      updatedAt: '2026-10-23T10:00:00.000Z',
+      ownerId: 'valid-user-a',
+    });
+    firestoreStore.set('users/valid-user-a/conversations/conv_2', {
+      title: 'Thread 2',
+      scope: { type: 'all' },
+      pinned: true,
+      createdAt: '2026-10-23T10:30:00.000Z',
+      updatedAt: '2026-10-23T10:30:00.000Z',
+      ownerId: 'valid-user-a',
+    });
+
+    const res = await request(app)
+      .get('/api/conversations')
+      .set('Authorization', 'Bearer valid-user-a');
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.total).toBe(2);
+    expect(res.body.conversations).toHaveLength(2);
+    // Thread 2 is newer, should be first
+    expect(res.body.conversations[0].id).toBe('conv_2');
+    expect(res.body.conversations[1].id).toBe('conv_1');
+  });
+
+  // 11. POST /api/conversations/:id/messages persists message and updates conversation
+  it('11. persists conversation messages in Firestore subcollection and updates parent timestamp', async () => {
+    firestoreStore.set('users/valid-user-a/conversations/conv_test', {
+      title: 'Test Thread',
+      scope: { type: 'all' },
+      pinned: false,
+      createdAt: '2026-10-23T10:00:00.000Z',
+      updatedAt: '2026-10-23T10:00:00.000Z',
+      ownerId: 'valid-user-a',
+    });
+
+    const msgRes = await request(app)
+      .post('/api/conversations/conv_test/messages')
+      .set('Authorization', 'Bearer valid-user-a')
+      .send({
+        id: 'msg_1',
+        role: 'user',
+        content: 'What is quantum entanglement?',
+        createdAt: 1761214000000,
+      });
+
+    expect(msgRes.status).toBe(200);
+    expect(msgRes.body.success).toBe(true);
+    expect(msgRes.body.message.id).toBe('msg_1');
+    expect(msgRes.body.message.role).toBe('user');
+    expect(msgRes.body.message.content).toBe('What is quantum entanglement?');
+
+    // Verify stored in subcollection users/valid-user-a/conversations/conv_test/messages/msg_1
+    const storedMsg = firestoreStore.get('users/valid-user-a/conversations/conv_test/messages/msg_1');
+    expect(storedMsg).toBeDefined();
+    expect(storedMsg.content).toBe('What is quantum entanglement?');
+
+    // Post assistant response with citations
+    const replyRes = await request(app)
+      .post('/api/conversations/conv_test/messages')
+      .set('Authorization', 'Bearer valid-user-a')
+      .send({
+        id: 'msg_2',
+        role: 'assistant',
+        content: 'Entanglement produces non-local correlations between separated particles.',
+        citations: [
+          {
+            chunkId: 'chunk_alpha_1_2_1',
+            documentId: 'doc_alpha_1',
+            documentName: 'Quantum Paper.pdf',
+            pageNumber: 2,
+            quote: 'Entanglement produces non-local correlations',
+            confidence: 0.95,
+          },
+        ],
+        latencyMs: 420,
+        modelUsed: 'gemini-3.8-flash',
+        createdAt: 1761214002000,
+      });
+
+    expect(replyRes.status).toBe(200);
+    expect(replyRes.body.success).toBe(true);
+    expect(replyRes.body.message.citations).toHaveLength(1);
+    expect(replyRes.body.message.citations[0].documentId).toBe('doc_alpha_1');
+  });
+
+  // 12. GET /api/conversations/:id/messages returns messages in chronological order
+  it('12. loads messages in chronological order across devices', async () => {
+    firestoreStore.set('users/valid-user-a/conversations/conv_order', {
+      title: 'Order Thread',
+      scope: { type: 'all' },
+      pinned: false,
+      createdAt: '2026-10-23T10:00:00.000Z',
+      updatedAt: '2026-10-23T10:00:00.000Z',
+      ownerId: 'valid-user-a',
+    });
+
+    firestoreStore.set('users/valid-user-a/conversations/conv_order/messages/msg_second', {
+      role: 'assistant',
+      content: 'Here is the answer.',
+      createdAt: '2026-10-23T10:02:00.000Z',
+      citations: [],
+    });
+
+    firestoreStore.set('users/valid-user-a/conversations/conv_order/messages/msg_first', {
+      role: 'user',
+      content: 'Hello, what is this?',
+      createdAt: '2026-10-23T10:01:00.000Z',
+      citations: [],
+    });
+
+    const res = await request(app)
+      .get('/api/conversations/conv_order/messages')
+      .set('Authorization', 'Bearer valid-user-a');
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.messages).toHaveLength(2);
+    // Chronological order: msg_first then msg_second
+    expect(res.body.messages[0].id).toBe('msg_first');
+    expect(res.body.messages[1].id).toBe('msg_second');
+  });
+
+  // 13. Multi-tenant isolation: User B cannot access User A's conversations or messages
+  it('13. prevents cross-user access to conversations and messages', async () => {
+    firestoreStore.set('users/valid-user-a/conversations/conv_secret', {
+      title: 'Secret User A Thread',
+      scope: { type: 'all' },
+      pinned: false,
+      createdAt: '2026-10-23T10:00:00.000Z',
+      updatedAt: '2026-10-23T10:00:00.000Z',
+      ownerId: 'valid-user-a',
+    });
+
+    firestoreStore.set('users/valid-user-a/conversations/conv_secret/messages/msg_sec', {
+      role: 'user',
+      content: 'Secret confidential prompt',
+      createdAt: '2026-10-23T10:00:00.000Z',
+    });
+
+    // User B tries to get User A's messages -> 404 NOT_FOUND
+    const getRes = await request(app)
+      .get('/api/conversations/conv_secret/messages')
+      .set('Authorization', 'Bearer valid-user-b');
+    expect(getRes.status).toBe(404);
+
+    // User B's conversations list does not contain User A's conversation
+    const listRes = await request(app)
+      .get('/api/conversations')
+      .set('Authorization', 'Bearer valid-user-b');
+    expect(listRes.status).toBe(200);
+    expect(listRes.body.conversations).toHaveLength(0);
+  });
+
+  // 14. DELETE /api/conversations/:id cascades deletion of conversation and subcollection messages
+  it('14. deletes conversation document and all subcollection messages on delete', async () => {
+    firestoreStore.set('users/valid-user-a/conversations/conv_del', {
+      title: 'Thread to delete',
+      scope: { type: 'all' },
+      pinned: false,
+      createdAt: '2026-10-23T10:00:00.000Z',
+      updatedAt: '2026-10-23T10:00:00.000Z',
+      ownerId: 'valid-user-a',
+    });
+
+    firestoreStore.set('users/valid-user-a/conversations/conv_del/messages/msg_del_1', {
+      role: 'user',
+      content: 'Question',
+    });
+    firestoreStore.set('users/valid-user-a/conversations/conv_del/messages/msg_del_2', {
+      role: 'assistant',
+      content: 'Answer',
+    });
+
+    const delRes = await request(app)
+      .delete('/api/conversations/conv_del')
+      .set('Authorization', 'Bearer valid-user-a');
+
+    expect(delRes.status).toBe(200);
+    expect(delRes.body.success).toBe(true);
+
+    // Conversation and messages removed from Firestore
+    expect(firestoreStore.has('users/valid-user-a/conversations/conv_del')).toBe(false);
+    expect(firestoreStore.has('users/valid-user-a/conversations/conv_del/messages/msg_del_1')).toBe(false);
+    expect(firestoreStore.has('users/valid-user-a/conversations/conv_del/messages/msg_del_2')).toBe(false);
+  });
+
+  // 15. Guest & unauthenticated rejection on conversations
+  it('15. rejects guest and unauthenticated requests to conversation endpoints', async () => {
+    const unauthGet = await request(app).get('/api/conversations');
+    expect(unauthGet.status).toBe(401);
+
+    const guestGet = await request(app)
+      .get('/api/conversations')
+      .set('Authorization', 'Bearer guest_test_session');
+    expect(guestGet.status).toBe(403);
+
+    const guestPost = await request(app)
+      .post('/api/conversations')
+      .set('Authorization', 'Bearer guest_test_session')
+      .send({ title: 'Guest Thread' });
+    expect(guestPost.status).toBe(403);
   });
 });

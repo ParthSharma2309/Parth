@@ -196,9 +196,11 @@ describe('Authentication & Authorization Hardening (tests/integration/auth.test.
     const origPid = process.env.FIREBASE_PROJECT_ID;
     const origVitePid = process.env.VITE_FIREBASE_PROJECT_ID;
     const origSa = process.env.FIREBASE_SERVICE_ACCOUNT;
+    const origDisable = process.env.FIREBASE_DISABLE_APPLET_CONFIG;
     delete process.env.FIREBASE_PROJECT_ID;
     delete process.env.VITE_FIREBASE_PROJECT_ID;
     delete process.env.FIREBASE_SERVICE_ACCOUNT;
+    process.env.FIREBASE_DISABLE_APPLET_CONFIG = 'true';
 
     vi.resetModules();
     const { setMockApps } = await import('../helpers/firebaseAdminMock.js');
@@ -227,6 +229,11 @@ describe('Authentication & Authorization Hardening (tests/integration/auth.test.
     if (origPid) process.env.FIREBASE_PROJECT_ID = origPid;
     if (origVitePid) process.env.VITE_FIREBASE_PROJECT_ID = origVitePid;
     if (origSa) process.env.FIREBASE_SERVICE_ACCOUNT = origSa;
+    if (origDisable !== undefined) {
+      process.env.FIREBASE_DISABLE_APPLET_CONFIG = origDisable;
+    } else {
+      delete process.env.FIREBASE_DISABLE_APPLET_CONFIG;
+    }
     setMockApps([
       {
         name: '[DEFAULT]',

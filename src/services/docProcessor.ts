@@ -3,7 +3,7 @@ import { extractTextFromPDF } from './pdf.ts';
 import { chunkDocumentPages } from './chunking.ts';
 import { embedChunks } from './embeddings.ts';
 import { authFetch } from './apiClient.ts';
-import { syncDocumentRecordToCloud, uploadDocumentChunksToCloud } from './cloudSync.ts';
+import { syncDocumentRecordToCloud, uploadDocumentChunksToCloud, loadDocumentBlob } from './cloudSync.ts';
 import {
   saveDocument,
   updateDocumentStatus,
@@ -23,6 +23,7 @@ export interface ProcessDocumentOptions {
   collectionId?: string;
   onProgress?: (progress: number, stepText: string) => void;
   serverDocId?: string;
+  storageBucket?: string;
   storagePath?: string;
   fileHash?: string;
   userId?: string;
@@ -74,6 +75,7 @@ export async function processPDFFile(
     modelUsed: settings.embeddingModel,
     hasExtractableText: true,
     fileHash,
+    storageBucket: options.storageBucket,
     storagePath: options.storagePath,
     userId: options.userId,
   };
@@ -228,6 +230,7 @@ export async function processPDFFile(
       processingStep: 'complete',
       hasOCR: hasAnyOCR,
       fileHash,
+      storageBucket: options.storageBucket,
       storagePath: options.storagePath,
       userId: options.userId,
       summary,
@@ -237,12 +240,15 @@ export async function processPDFFile(
 
     // Sync to Firestore & Cloud Storage if user is authenticated
     if (options.userId) {
-      syncDocumentRecordToCloud(options.userId, finalDoc, options.storagePath).catch((syncErr) => {
-        console.warn('Background Firestore document sync skipped:', syncErr);
-      });
-      uploadDocumentChunksToCloud(docId, embeddedChunks).catch((chunkSyncErr) => {
-        console.warn('Background cloud chunks sync skipped:', chunkSyncErr);
-      });
+      options.onProgress?.(95, 'Syncing metadata and indexed passages to cloud...');
+      try {
+        await Promise.all([
+          syncDocumentRecordToCloud(options.userId, finalDoc, options.storagePath),
+          uploadDocumentChunksToCloud(docId, embeddedChunks),
+        ]);
+      } catch (syncErr) {
+        console.warn('Cloud sync error for document:', syncErr);
+      }
     }
 
     options.onProgress?.(100, 'Ready');
@@ -467,7 +473,10 @@ export async function retryProcessDocument(
   onProgress?: (progress: number, stepText: string) => void
 ): Promise<void> {
   const doc = await getDocumentById(docId);
-  const blob = await getDocumentBlob(docId);
+  let blob: Blob | null | undefined = await getDocumentBlob(docId);
+  if (!blob) {
+    blob = await loadDocumentBlob(docId);
+  }
   if (!blob) {
     throw new Error('Original document blob was not found in storage. Please re-upload the file.');
   }
@@ -488,7 +497,7 @@ export async function retryProcessDocument(
   });
 
   try {
-    let pages: Array<{ pageNumber: number; text: string }> = [];
+    let pages: Array<{ pageNumber: number; text: string; isOCR?: boolean }> = [];
     let pageCount = 1;
     let totalCharacters = 0;
     let avgCharacters = 0;
@@ -523,7 +532,7 @@ export async function retryProcessDocument(
       const data = await res.json();
       const txt = (data.text || '').trim();
       if (!txt) throw new Error('No text or figures extracted from image');
-      pages = [{ pageNumber: 1, text: txt }];
+      pages = [{ pageNumber: 1, text: txt, isOCR: true }];
       totalCharacters = txt.length;
       avgCharacters = txt.length;
     } else {
@@ -567,15 +576,34 @@ export async function retryProcessDocument(
 
     await saveChunks(embeddedChunks);
 
-    await updateDocumentStatus(docId, {
+    const hasAnyOCR = pages.some((p: any) => p.isOCR);
+    const updatedStatus: Partial<DocumentRecord> = {
       status: 'Ready',
+      stage: 'Ready',
       statusMessage: 'Indexed & ready for research',
       progress: 100,
       processingStep: 'complete',
       pageCount,
       extractedCharacters: totalCharacters,
       avgCharactersPerPage: avgCharacters,
-    });
+      hasExtractableText: true,
+      hasOCR: hasAnyOCR,
+    };
+    await updateDocumentStatus(docId, updatedStatus);
+
+    // Sync updated document and chunks to cloud if user is authenticated
+    const updatedDoc = await getDocumentById(docId);
+    if (updatedDoc && (updatedDoc.ownerId || updatedDoc.userId)) {
+      const uid = updatedDoc.ownerId || updatedDoc.userId;
+      if (uid && uid !== 'guest') {
+        uploadDocumentChunksToCloud(docId, embeddedChunks).catch((err) =>
+          console.warn('[DocProcessor] Chunk upload to cloud failed during OCR retry:', err)
+        );
+        syncDocumentRecordToCloud(uid, updatedDoc, updatedDoc.storagePath).catch((err) =>
+          console.warn('[DocProcessor] Doc sync to cloud failed during OCR retry:', err)
+        );
+      }
+    }
   } catch (err: any) {
     console.error(`Retry processing failed for ${docId}:`, err);
     await updateDocumentStatus(docId, {

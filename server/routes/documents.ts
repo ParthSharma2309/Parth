@@ -22,6 +22,7 @@ const FORBIDDEN_UPDATE_FIELDS = [
   'ownerId',
   'uid',
   'userId',
+  'storageBucket',
   'storagePath',
   'size',
   'hash',
@@ -328,52 +329,86 @@ documentsRouter.delete(
       }
 
       const existingData = docSnap.data()!;
-
-      // Ownership guard
       if (existingData.ownerId && existingData.ownerId !== uid) {
-        return res.status(403).json({
-          error: 'Access denied: you do not have permission to delete this document.',
-          code: 'FORBIDDEN',
+        return res.status(404).json({
+          error: 'Document not found.',
+          code: 'NOT_FOUND',
           requestId,
         });
       }
 
-      // If document has a storage file, delete it from Supabase Storage
-      const storagePath = existingData.storagePath;
-      if (storagePath && isSupabaseConfigured()) {
-        // Enforce that path is strictly scoped to this user
-        if (typeof storagePath === 'string' && storagePath.startsWith(`${uid}/`)) {
-          try {
-            const supabase = getSupabaseAdminClient();
-            await supabase.storage.from(getSupabaseBucket()).remove([storagePath]);
-            logger.info({ storagePath, uid }, 'Removed file from Supabase Storage on document deletion');
-          } catch (storageErr: any) {
+      const storagePath: string | undefined = existingData.storagePath;
+      let bucket = existingData.storageBucket || getSupabaseBucket();
+
+      // Collect candidate paths strictly scoped to this user to guarantee clean storage state
+      const pathsToDelete = new Set<string>();
+      if (storagePath && (storagePath.startsWith(`${uid}/`) || storagePath.startsWith(`users/${uid}/`))) {
+        pathsToDelete.add(storagePath);
+      }
+      pathsToDelete.add(`${uid}/${docId}.pdf`);
+      const pathsArray = Array.from(pathsToDelete);
+
+      if (isSupabaseConfigured()) {
+        try {
+          const supabase = getSupabaseAdminClient();
+          // 1. Remove specific direct file paths
+          const { data: removedDirect, error: removeErr } = await supabase.storage
+            .from(bucket)
+            .remove(pathsArray);
+
+          if (removeErr) {
             logger.warn(
-              { err: storageErr.message, storagePath },
-              'Failed to remove storage object during document delete'
+              { err: removeErr.message, pathsToDelete, bucket, requestId },
+              'Supabase Storage direct file remove warning'
+            );
+          } else if (removedDirect && removedDirect.length > 0) {
+            logger.info(
+              { paths: removedDirect.map((r) => r.name), bucket, uid },
+              'Removed file(s) from Supabase Storage on document deletion'
             );
           }
-        } else {
+
+          // 2. Also check and clean up folder users/{uid}/{docId} if it exists
+          const folderPrefix = `users/${uid}/${docId}`;
+          if (typeof supabase.storage.from(bucket).list === 'function') {
+            const { data: folderFiles } = await supabase.storage.from(bucket).list(folderPrefix);
+            if (folderFiles && folderFiles.length > 0) {
+              const folderPaths = folderFiles.map((f) => `${folderPrefix}/${f.name}`);
+              const { error: folderErr } = await supabase.storage.from(bucket).remove(folderPaths);
+              if (folderErr) {
+                logger.warn({ err: folderErr.message, folderPaths }, 'Error removing folder files in Supabase');
+              } else {
+                logger.info({ folderPaths, bucket, uid }, 'Removed folder files from Supabase Storage');
+              }
+            }
+          }
+        } catch (storageErr: any) {
           logger.warn(
-            { storagePath, uid },
-            'Storage path on document did not match user prefix; skipping storage file deletion for safety'
+            { err: storageErr.message, docId, uid },
+            'Failed during Supabase storage object cleanup'
           );
         }
       }
 
-      // Delete document record from Firestore
-      await docRef.delete();
+      // Delete document record from Firestore if present
+      if (docSnap.exists) {
+        await docRef.delete();
+      }
 
-      // Delete associated chunks from users/${uid}/chunks if any exist
+      // Delete associated chunks from users/${uid}/chunks in batches of <= 400
       try {
         const chunksSnap = await adminFirestore
           .collection(`users/${uid}/chunks`)
           .where('documentId', '==', docId)
           .get();
         if (!chunksSnap.empty) {
-          const batch = adminFirestore.batch();
-          chunksSnap.docs.forEach((d) => batch.delete(d.ref));
-          await batch.commit();
+          const batchSize = 400;
+          for (let i = 0; i < chunksSnap.docs.length; i += batchSize) {
+            const batch = adminFirestore.batch();
+            const chunkSlice = chunksSnap.docs.slice(i, i + batchSize);
+            chunkSlice.forEach((d) => batch.delete(d.ref));
+            await batch.commit();
+          }
           logger.info({ docId, uid, chunkCount: chunksSnap.size }, 'Removed document chunks from Firestore');
         }
       } catch (chunkDelErr: any) {
@@ -466,8 +501,11 @@ documentsRouter.get(
         });
       }
 
-      // Security check: ensure storagePath belongs to this user
-      if (!storagePath.startsWith(`${uid}/`)) {
+      // Security check: ensure storagePath belongs strictly to this user
+      if (
+        !storagePath.startsWith(`${uid}/`) &&
+        !storagePath.startsWith(`users/${uid}/`)
+      ) {
         return res.status(403).json({
           error: 'Access denied to storage path.',
           code: 'FORBIDDEN',
@@ -476,9 +514,10 @@ documentsRouter.get(
       }
 
       const supabase = getSupabaseAdminClient();
+      const bucket = data.storageBucket || getSupabaseBucket();
       // Signed URL expires in 15 minutes (900 seconds)
       const { data: signData, error: signErr } = await supabase.storage
-        .from(getSupabaseBucket())
+        .from(bucket)
         .createSignedUrl(storagePath, 900);
 
       if (signErr || !signData?.signedUrl) {

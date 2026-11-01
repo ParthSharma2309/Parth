@@ -19,6 +19,7 @@ import { documentsRouter } from './routes/documents.js';
 import { embedRouter } from './routes/embed.js';
 import { generateRouter } from './routes/generate.js';
 import { rewriteRouter } from './routes/rewrite.js';
+import { conversationsRouter } from './routes/conversations.js';
 import { requireAuth } from './lib/authMiddleware.js';
 import { isFirebaseAuthConfigured } from './lib/firebaseAdmin.js';
 import { isSupabaseConfigured } from './lib/supabaseAdmin.js';
@@ -122,6 +123,7 @@ app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
 // Mount remaining API routes
 app.use(documentsRouter);
+app.use(conversationsRouter);
 app.use(embedRouter);
 app.use(generateRouter);
 app.use(rewriteRouter);

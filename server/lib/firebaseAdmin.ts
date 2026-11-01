@@ -1,3 +1,5 @@
+import fs from 'fs';
+import path from 'path';
 import { getApps, initializeApp, cert, App } from 'firebase-admin/app';
 import { getAuth, Auth } from 'firebase-admin/auth';
 import { getFirestore, Firestore } from 'firebase-admin/firestore';
@@ -20,6 +22,19 @@ export type DecodedAuthUser = AuthPrincipal;
 let adminAuth: Auth | null = null;
 let adminFirestore: Firestore | null = null;
 let appInstance: App | null = null;
+
+function loadAppletConfig(): any | null {
+  if (process.env.FIREBASE_DISABLE_APPLET_CONFIG === 'true') {
+    return null;
+  }
+  try {
+    const configPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
+    if (fs.existsSync(configPath)) {
+      return JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    }
+  } catch {}
+  return null;
+}
 
 function parseServiceAccount(): any | null {
   // Format 1: Complete JSON string or base64-encoded JSON in FIREBASE_SERVICE_ACCOUNT
@@ -64,6 +79,10 @@ export function resolveProjectId(serviceAccount?: any): string | undefined {
   }
   if (serviceAccount && typeof serviceAccount.project_id === 'string' && serviceAccount.project_id.trim()) {
     return serviceAccount.project_id.trim();
+  }
+  const appletCfg = loadAppletConfig();
+  if (appletCfg?.projectId) {
+    return appletCfg.projectId;
   }
   return undefined;
 }
@@ -118,7 +137,9 @@ export function getAdminFirestore(): Firestore | null {
   getAdminAuth();
   if (!appInstance) return null;
   try {
-    adminFirestore = getFirestore(appInstance);
+    const appletCfg = loadAppletConfig();
+    const dbId = process.env.FIREBASE_DATABASE_ID || appletCfg?.firestoreDatabaseId;
+    adminFirestore = dbId ? getFirestore(appInstance, dbId) : getFirestore(appInstance);
     return adminFirestore;
   } catch (err) {
     logger.warn({ err: (err as Error).message }, 'Failed to initialize Firebase Admin Firestore');

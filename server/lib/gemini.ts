@@ -386,14 +386,14 @@ export async function generateWithFallback<T>(
         if (errType === 'quota') {
           const delayMs = parseRetryDelayMs(err) || 60000;
           setModelCooldown(currentModel, delayMs);
-          logger.warn(
+          logger.info(
             { requestId, model: currentModel, cooldownMs: delayMs },
             `Quota limit reached for model ${currentModel}, cooldown set`
           );
         } else if (errType === 'unavailable' || errType === 'timeout') {
           // Set 60s cooldown for overloaded (503) or timed out (504) models so concurrent/subsequent requests route directly to fallback
           setModelCooldown(currentModel, 60000);
-          logger.warn(
+          logger.info(
             { requestId, model: currentModel, errType },
             `Model ${currentModel} is ${errType}, setting 60s cooldown`
           );
@@ -402,7 +402,7 @@ export async function generateWithFallback<T>(
         // For unavailable (503) or timeout (504), if healthy fallback models exist, immediately switch
         // to the fallback model instead of wasting remaining request time on an overloaded model
         if (!isLastModel && (errType === 'unavailable' || errType === 'timeout')) {
-          logger.warn(
+          logger.info(
             { requestId, failedModel: currentModel, errType, nextModel: candidateModels[mIdx + 1] },
             `Model ${currentModel} is ${errType}, immediately falling through to fallback model ${candidateModels[mIdx + 1]}`
           );
@@ -423,7 +423,7 @@ export async function generateWithFallback<T>(
 
         // Fall through to next model if available
         if (!isLastModel) {
-          logger.warn(
+          logger.info(
             { requestId, failedModel: currentModel, errType, nextModel: candidateModels[mIdx + 1] },
             `Model ${currentModel} exhausted retries, falling through to fallback model`
           );

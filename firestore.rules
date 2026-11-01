@@ -44,11 +44,12 @@ service cloud.firestore {
         data.name is string && data.name.size() > 0 && data.name.size() <= 255 &&
         data.pages is int && data.pages >= 0 &&
         data.size is int && data.size >= 0 && data.size <= 50000000 &&
-        data.status in ['indexing', 'ready', 'error'] &&
+        data.status in ['indexing', 'ready', 'error', 'processing', 'failed'] &&
         data.createdAt is string &&
         (!('ownerId' in data) || (data.ownerId is string && data.ownerId.size() <= 128)) &&
         (!('hash' in data) || (data.hash is string && data.hash.size() <= 128)) &&
         (!('summary' in data) || (data.summary is string && data.summary.size() <= 5000)) &&
+        (!('storageBucket' in data) || (data.storageBucket is string && data.storageBucket.size() <= 128)) &&
         (!('storagePath' in data) || (data.storagePath is string && data.storagePath.size() <= 512)) &&
         (!('topics' in data) || (data.topics is list && data.topics.size() <= 50));
     }
@@ -140,7 +141,7 @@ service cloud.firestore {
         allow read: if isOwner(uid);
         allow create: if isOwner(uid) && isValidId(docId) && isValidDocumentRecord(incoming()) &&
           (!('ownerId' in incoming()) || incoming().ownerId == uid) &&
-          (!('storagePath' in incoming()) || incoming().storagePath.matches('^' + uid + '/.*'));
+          (!('storagePath' in incoming()) || incoming().storagePath.matches('^' + uid + '/.*') || incoming().storagePath.matches('^users/' + uid + '/.*'));
         allow update: if isOwner(uid) && isValidId(docId) && isValidDocumentRecord(incoming()) &&
           incoming().createdAt == existing().createdAt &&
           (!('ownerId' in existing()) || incoming().ownerId == existing().ownerId) &&

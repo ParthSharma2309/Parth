@@ -94,13 +94,14 @@ describe('Secure Document Uploads to Supabase Storage (tests/integration/upload.
     expect(doc.status).toBe('indexing');
     expect(doc.collectionId).toBe('col_quantum_computing');
 
-    // Storage path scoped to authenticated UID: valid-user-a/<docId>.pdf
-    expect(doc.storagePath).toBe(`valid-user-a/${doc.id}.pdf`);
+    // Storage path scoped to authenticated UID: users/valid-user-a/<docId>/quantum_algorithms.pdf
+    expect(doc.storagePath).toBe(`users/valid-user-a/${doc.id}/quantum_algorithms.pdf`);
+    expect(doc.storageBucket).toBe('documents');
 
     // Verify Supabase upload was invoked with correct arguments
     expect(mockStorageUpload).toHaveBeenCalledTimes(1);
     const [calledPath, calledBuffer, calledOpts] = mockStorageUpload.mock.calls[0];
-    expect(calledPath).toBe(`valid-user-a/${doc.id}.pdf`);
+    expect(calledPath).toBe(`users/valid-user-a/${doc.id}/quantum_algorithms.pdf`);
     expect(Buffer.isBuffer(calledBuffer)).toBe(true);
     expect(calledOpts.contentType).toBe('application/pdf');
 
@@ -108,7 +109,8 @@ describe('Secure Document Uploads to Supabase Storage (tests/integration/upload.
     expect(mockFirestoreSet).toHaveBeenCalledTimes(1);
     const firestoreData = mockFirestoreSet.mock.calls[0][0];
     expect(firestoreData.name).toBe('quantum_algorithms.pdf');
-    expect(firestoreData.storagePath).toBe(`valid-user-a/${doc.id}.pdf`);
+    expect(firestoreData.storagePath).toBe(`users/valid-user-a/${doc.id}/quantum_algorithms.pdf`);
+    expect(firestoreData.storageBucket).toBe('documents');
     expect(firestoreData.status).toBe('indexing');
   });
 
@@ -245,11 +247,11 @@ describe('Secure Document Uploads to Supabase Storage (tests/integration/upload.
     const doc = res.body.document;
 
     // Must be scoped strictly to verified authenticated user 'valid-user-a', NEVER 'victim-user-123'
-    expect(doc.storagePath).toMatch(/^valid-user-a\/doc_/);
+    expect(doc.storagePath).toMatch(/^users\/valid-user-a\/doc_/);
     expect(doc.storagePath).not.toContain('victim-user-123');
 
     const calledPath = mockStorageUpload.mock.calls[0][0];
-    expect(calledPath).toMatch(/^valid-user-a\/doc_/);
+    expect(calledPath).toMatch(/^users\/valid-user-a\/doc_/);
     expect(calledPath).not.toContain('victim-user-123');
   });
 

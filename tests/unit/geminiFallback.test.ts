@@ -9,7 +9,7 @@ describe('generateWithFallback resilient routing & timeouts', () => {
   it('immediately falls through to fallback model on 503 unavailable without retrying overloaded model', async () => {
     const attempts: string[] = [];
 
-    const result = await generateWithFallback({
+    const result = await generateWithFallback<{ text: string }>({
       models: ['gemini-overloaded-503', 'gemini-fallback-fast'],
       requestId: 'req-test-503',
       build: async (model) => {
@@ -36,7 +36,7 @@ describe('generateWithFallback resilient routing & timeouts', () => {
     expect(isModelInCooldown('gemini-slow-cooldown')).toBe(true);
 
     const attempts: string[] = [];
-    const result = await generateWithFallback({
+    const result = await generateWithFallback<{ text: string }>({
       models: ['gemini-slow-cooldown', 'gemini-fallback-fast'],
       requestId: 'req-test-cooldown',
       build: async (model) => {
@@ -53,14 +53,14 @@ describe('generateWithFallback resilient routing & timeouts', () => {
   it('handles per-attempt timeout and falls through to next candidate model', async () => {
     const attempts: string[] = [];
 
-    const result = await generateWithFallback({
+    const result = await generateWithFallback<{ text: string }>({
       models: ['gemini-slow-timeout', 'gemini-fallback-fast'],
       requestId: 'req-test-timeout',
       perModelTimeoutMs: 50, // fast timeout for test
       build: async (model, attemptSignal) => {
         attempts.push(model);
         if (model === 'gemini-slow-timeout') {
-          return new Promise((resolve, reject) => {
+          return new Promise<{ text: string }>((resolve, reject) => {
             attemptSignal?.addEventListener('abort', () => {
               const err = new Error('ETIMEDOUT');
               (err as any).name = 'AbortError';

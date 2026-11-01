@@ -15,15 +15,17 @@ import { DocumentRecord, CollectionRecord, ConversationRecord, Citation } from '
 import {
   getAllDocuments,
   saveDocument,
+  deleteDocument,
   getAllCollections,
   getAllConversations,
+  deleteConversation,
   getSettings,
   requestPersistentStorage,
   checkDatabaseIntegrity,
   repairDatabaseIntegrity,
   IntegrityReport,
 } from './services/storage.ts';
-import { fetchCloudDocuments } from './services/cloudSync.ts';
+import { fetchCloudDocuments, fetchCloudConversations } from './services/cloudSync.ts';
 import { AuthProvider, useAuth } from './auth/AuthProvider.tsx';
 import { RequireAuth } from './auth/RequireAuth.tsx';
 import { FirebaseConfigError } from './components/auth/FirebaseConfigError.tsx';
@@ -76,6 +78,7 @@ function AppInner() {
   const [workspaceInitialDocId, setWorkspaceInitialDocId] = useState<string | undefined>(undefined);
   const [workspaceInitialCitation, setWorkspaceInitialCitation] = useState<Citation | null>(null);
   const [workspaceOpenDeskOnLoad, setWorkspaceOpenDeskOnLoad] = useState<boolean>(false);
+  const [workspaceOpenDeskToken, setWorkspaceOpenDeskToken] = useState<number>(0);
 
   const refreshData = useCallback(async () => {
     try {
@@ -85,36 +88,59 @@ function AppInner() {
         getAllConversations(),
       ]);
 
-      // If registered user, fetch cloud-synced documents
+      // If registered user, fetch cloud-synced documents & conversations
       if (user && !isGuest) {
         try {
-          const cloudDocs = await fetchCloudDocuments();
-          if (cloudDocs) {
-            const docMap = new Map<string, DocumentRecord>();
-            // 1. Add authoritative cloud records scoped to this user
+          const [cloudDocs, cloudConvs] = await Promise.all([
+            fetchCloudDocuments(),
+            fetchCloudConversations(),
+          ]);
+
+          const docMap = new Map<string, DocumentRecord>();
+          // If cloudDocs fetch succeeded, incorporate cloud records
+          if (Array.isArray(cloudDocs)) {
             for (const cd of cloudDocs) {
               const normalized = { ...cd, ownerId: cd.ownerId || user.uid };
               docMap.set(cd.id, normalized);
               saveDocument(normalized).catch(() => {});
             }
-            // 2. Merge local records matching this user's UID
-            for (const d of docs) {
-              if (docMap.has(d.id)) {
-                const cloudDoc = docMap.get(d.id)!;
-                docMap.set(d.id, { ...d, ...cloudDoc });
-              } else if (!d.storagePath && (!d.ownerId || d.ownerId === user.uid || d.userId === user.uid)) {
-                // Pending local document
-                docMap.set(d.id, d);
-              }
-            }
-            const merged = Array.from(docMap.values());
-            setDocuments(merged);
-            setCollections(cols);
-            setConversations(convs);
-            return;
           }
+          // Merge local records: preserve all local user documents without deleting merely because a cloud fetch was empty
+          for (const d of docs) {
+            if (docMap.has(d.id)) {
+              const cloudDoc = docMap.get(d.id)!;
+              docMap.set(d.id, { ...d, ...cloudDoc });
+            } else if (!d.ownerId || d.ownerId === user.uid || d.userId === user.uid) {
+              // Preserve local document record (do not delete on sync)
+              docMap.set(d.id, d);
+            }
+          }
+
+          const convMap = new Map<string, ConversationRecord>();
+          // If cloudConvs fetch succeeded, incorporate cloud conversations
+          if (Array.isArray(cloudConvs)) {
+            for (const cc of cloudConvs) {
+              convMap.set(cc.id, { ...cc, userId: user.uid });
+            }
+          }
+          // Merge local conversations: preserve local threads without deleting on sync
+          for (const c of convs) {
+            if (convMap.has(c.id)) {
+              const cloudConv = convMap.get(c.id)!;
+              convMap.set(c.id, { ...c, ...cloudConv });
+            } else if (!c.userId || c.userId === user.uid) {
+              convMap.set(c.id, { ...c, userId: user.uid });
+            }
+          }
+
+          const mergedDocs = Array.from(docMap.values());
+          const mergedConvs = Array.from(convMap.values()).sort((a, b) => b.updatedAt - a.updatedAt);
+          setDocuments(mergedDocs);
+          setCollections(cols);
+          setConversations(mergedConvs);
+          return;
         } catch (cloudErr) {
-          console.warn('Could not fetch cloud documents:', cloudErr);
+          console.warn('Could not fetch cloud documents or conversations:', cloudErr);
         }
       } else {
         // Guest or unauthenticated session: only show local guest documents (never cloud documents)
@@ -300,6 +326,7 @@ function AppInner() {
     setWorkspaceInitialDocId(docId);
     setWorkspaceInitialCitation(null);
     setWorkspaceOpenDeskOnLoad(false);
+    setWorkspaceOpenDeskToken(Date.now());
     handleTabChange('workspace');
   };
 
@@ -307,6 +334,7 @@ function AppInner() {
     setWorkspaceInitialDocId(docId);
     setWorkspaceInitialCitation(null);
     setWorkspaceOpenDeskOnLoad(true);
+    setWorkspaceOpenDeskToken(Date.now());
     handleTabChange('workspace');
   };
 
@@ -326,6 +354,13 @@ function AppInner() {
     });
     handleTabChange('workspace');
   };
+
+  const handleDocumentDeleted = useCallback((docId: string) => {
+    if (workspaceInitialDocId === docId) {
+      setWorkspaceInitialDocId(undefined);
+    }
+    setDocuments((prev) => prev.filter((d) => d.id !== docId));
+  }, [workspaceInitialDocId]);
 
   if (!isFirebaseConfigured && !user && !isGuest && !loading) {
     return <FirebaseConfigError onContinueAsGuest={continueAsGuest} />;
@@ -399,6 +434,7 @@ function AppInner() {
                 initialDocumentId={workspaceInitialDocId}
                 initialCitation={workspaceInitialCitation}
                 openDeskOnLoad={workspaceOpenDeskOnLoad}
+                openDeskToken={workspaceOpenDeskToken}
                 onNavigateToNotebook={() => handleTabChange('notebook')}
               />
             </ErrorBoundary>
@@ -439,6 +475,7 @@ function AppInner() {
                         onRefresh={refreshData}
                         onOpenDocumentInWorkspace={handleOpenDocumentInWorkspace}
                         onOpenInReadingDesk={handleOpenInReadingDesk}
+                        onDeleteDocument={handleDocumentDeleted}
                       />
                     </Suspense>
                   </ErrorBoundary>

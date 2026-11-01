@@ -113,9 +113,10 @@ export const Dropzone: React.FC<DropzoneProps> = ({
 
         let serverDocId: string | undefined = undefined;
         let storagePath: string | undefined = undefined;
+        let storageBucket: string | undefined = undefined;
         const currentFirebaseUser = auth?.currentUser;
 
-        // If user is authenticated with Firebase, upload PDF to secure Supabase Storage
+        // If user is authenticated with Firebase, upload PDF to secure private Supabase Storage
         if (currentFirebaseUser && !currentFirebaseUser.isAnonymous) {
           setStepText('Uploading document to private storage...');
           setProgressPercent(12);
@@ -133,38 +134,32 @@ export const Dropzone: React.FC<DropzoneProps> = ({
 
           if (!uploadRes.ok) {
             const errData = await uploadRes.json().catch(() => ({}));
-            if (uploadRes.status === 503) {
-              // Supabase not configured: continue with local browser storage
-              showToast({
-                message: 'Supabase Storage not configured; indexing locally in browser storage.',
-                type: 'info',
-                duration: 4000,
-              });
-            } else if (uploadRes.status === 401) {
-              throw new Error('Your session has expired. Please sign in again.');
-            } else if (uploadRes.status === 413) {
-              throw new Error(errData.error || `File "${file.name}" exceeds the 50MB maximum upload limit.`);
-            } else {
-              // Cloud storage unavailable or bucket uninitialized: fall back to local browser indexing
-              console.warn(`Supabase Storage upload warning (${uploadRes.status}):`, errData.error || uploadRes.statusText);
-              showToast({
-                message: `Cloud storage unavailable (${errData.error || uploadRes.statusText}); indexing locally in browser.`,
-                type: 'info',
-                duration: 5000,
-              });
-            }
+            const errMsg =
+              errData.error ||
+              (uploadRes.status === 401
+                ? 'Your session has expired. Please sign in again.'
+                : uploadRes.status === 413
+                ? `File "${file.name}" exceeds the 50MB maximum upload limit.`
+                : uploadRes.status === 503
+                ? 'Supabase Storage is not configured on this server.'
+                : `Upload failed (${uploadRes.status}): ${uploadRes.statusText}`);
+            throw new Error(errMsg);
+          }
+
+          const uploadData = await uploadRes.json();
+          if (uploadData?.document?.id && uploadData?.document?.storagePath) {
+            serverDocId = uploadData.document.id;
+            storagePath = uploadData.document.storagePath;
+            storageBucket = uploadData.document.storageBucket;
           } else {
-            const uploadData = await uploadRes.json();
-            if (uploadData?.document) {
-              serverDocId = uploadData.document.id;
-              storagePath = uploadData.document.storagePath;
-            }
+            throw new Error('Upload succeeded on storage but server returned invalid document metadata.');
           }
         }
 
         const processedDoc = await processPDFFile(file, file.name, {
           collectionId,
           serverDocId,
+          storageBucket,
           storagePath,
           fileHash,
           userId: currentFirebaseUser?.uid,

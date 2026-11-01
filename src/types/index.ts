@@ -20,7 +20,8 @@ export interface DocumentRecord {
   modelUsed: string;
   hasExtractableText: boolean;
   hasOCR?: boolean;
-  storagePath?: string; // Scoped storage path in Supabase Storage (e.g., <uid>/<docId>.pdf)
+  storageBucket?: string; // Target private Supabase Storage bucket
+  storagePath?: string; // Scoped storage path in Supabase Storage (e.g., users/<uid>/<docId>/<filename>)
   userId?: string; // Authenticated Firebase user ID
   ownerId?: string; // Owner UID matching Firestore metadata
   summary?: string;

@@ -43,7 +43,17 @@ import { ScopeSelector } from './ScopeSelector.tsx';
 import { PDFViewer } from '../pdf/PDFViewer.tsx';
 import { PreviousAnswersArchiveModal } from './PreviousAnswersArchiveModal.tsx';
 import { useToast } from '../ui/Toast.tsx';
-import { loadDocumentBlob, downloadDocumentFile, ensureDocumentChunksAvailable } from '../../services/cloudSync.ts';
+import { useAuth } from '../../auth/AuthProvider.tsx';
+import {
+  loadDocumentBlob,
+  downloadDocumentFile,
+  ensureDocumentChunksAvailable,
+  fetchCloudConversations,
+  fetchCloudMessages,
+  saveCloudConversation,
+  saveCloudMessage,
+  deleteCloudConversation,
+} from '../../services/cloudSync.ts';
 
 interface WorkspaceProps {
   documents: DocumentRecord[];
@@ -51,6 +61,7 @@ interface WorkspaceProps {
   initialDocumentId?: string;
   initialCitation?: Citation | null;
   openDeskOnLoad?: boolean;
+  openDeskToken?: number;
   onNavigateToNotebook?: () => void;
 }
 
@@ -60,6 +71,7 @@ export const Workspace: React.FC<WorkspaceProps> = ({
   initialDocumentId,
   initialCitation,
   openDeskOnLoad = false,
+  openDeskToken,
   onNavigateToNotebook,
 }) => {
   // Reading Desk Open State (Default false, hidden on first load)
@@ -101,10 +113,42 @@ export const Workspace: React.FC<WorkspaceProps> = ({
   const [showJumpToLatest, setShowJumpToLatest] = useState<boolean>(false);
 
   const { showToast } = useToast();
+  const { user, isGuest } = useAuth();
 
   const loadConversations = useCallback(async () => {
     try {
-      const convs = await getAllConversations();
+      let convs: ConversationRecord[] = [];
+      if (user && !isGuest) {
+        const [cloudConvs, localConvs] = await Promise.all([
+          fetchCloudConversations(),
+          getAllConversations(),
+        ]);
+        const map = new Map<string, ConversationRecord>();
+        if (Array.isArray(cloudConvs)) {
+          for (const c of cloudConvs) map.set(c.id, { ...c, userId: user.uid });
+          for (const l of localConvs) {
+            if (!map.has(l.id)) {
+              if (l.userId === user.uid) {
+                // Deleted on another device
+                deleteConversation(l.id).catch(() => {});
+              } else if (!l.userId) {
+                map.set(l.id, { ...l, userId: user.uid });
+              }
+            }
+          }
+        } else {
+          for (const l of localConvs) {
+            if (l.userId === user.uid || !l.userId) {
+              map.set(l.id, { ...l, userId: user.uid });
+            }
+          }
+        }
+        convs = Array.from(map.values()).sort((a, b) => b.updatedAt - a.updatedAt);
+      } else {
+        const local = await getAllConversations();
+        convs = local.filter((c) => !c.userId || c.userId === 'guest');
+      }
+
       setConversations(convs);
       if (convs.length > 0 && !activeConvId) {
         selectConversation(convs[0].id);
@@ -112,7 +156,7 @@ export const Workspace: React.FC<WorkspaceProps> = ({
     } catch (err) {
       console.error('Failed to load conversations:', err);
     }
-  }, [activeConvId]);
+  }, [activeConvId, user, isGuest]);
 
   useEffect(() => {
     loadConversations();
@@ -152,14 +196,12 @@ export const Workspace: React.FC<WorkspaceProps> = ({
   useEffect(() => {
     if (initialDocumentId) {
       loadDocForViewer(initialDocumentId, 1);
-      setCurrentScope((prev) =>
-        prev.type === 'all' ? { type: 'selected', documentIds: [initialDocumentId] } : prev
-      );
+      setCurrentScope({ type: 'selected', documentIds: [initialDocumentId] });
       if (openDeskOnLoad) {
         setDeskOpen(true);
       }
     }
-  }, [initialDocumentId, openDeskOnLoad, loadDocForViewer]);
+  }, [initialDocumentId, openDeskOnLoad, openDeskToken, loadDocForViewer]);
 
   useEffect(() => {
     if (initialCitation) {
@@ -217,6 +259,31 @@ export const Workspace: React.FC<WorkspaceProps> = ({
     };
   }, []);
 
+  // Safely deselect and close Reading Desk if active document is removed from documents list
+  useEffect(() => {
+    if (activeDocId && !documents.some((d) => d.id === activeDocId)) {
+      setActiveDocId(null);
+      setActivePdfBlob(undefined);
+      setActivePdfName('Document');
+      setActiveCitation(null);
+      setDeskOpen(false);
+    }
+
+    // Prune deleted documents from active selection scope
+    setCurrentScope((prev) => {
+      if (prev.type === 'selected') {
+        const remaining = prev.documentIds.filter((id) => documents.some((d) => d.id === id));
+        if (remaining.length === 0) {
+          return { type: 'all' };
+        }
+        if (remaining.length !== prev.documentIds.length) {
+          return { type: 'selected', documentIds: remaining };
+        }
+      }
+      return prev;
+    });
+  }, [documents, activeDocId]);
+
   const selectConversation = async (convId: string) => {
     setActiveConvId(convId);
     try {
@@ -225,8 +292,16 @@ export const Workspace: React.FC<WorkspaceProps> = ({
       if (conv?.scope) {
         setCurrentScope(conv.scope);
       }
-      const msgs = await getMessagesByConversation(convId);
+      const msgs = (await getMessagesByConversation(convId)) || [];
       setMessages(msgs);
+
+      // If registered user, fetch latest cloud messages from Firestore
+      if (user && !isGuest) {
+        const cloudMsgs = await fetchCloudMessages(convId);
+        if (Array.isArray(cloudMsgs)) {
+          setMessages(cloudMsgs);
+        }
+      }
     } catch (err) {
       console.error('Failed to load conversation details:', err);
     }
@@ -240,8 +315,13 @@ export const Workspace: React.FC<WorkspaceProps> = ({
       scope: currentScope,
       createdAt: Date.now(),
       updatedAt: Date.now(),
+      userId: user?.uid,
     };
-    await saveConversation(newConv);
+    try {
+      await saveCloudConversation(newConv);
+    } catch (saveErr) {
+      console.warn('Failed to persist new conversation to cloud:', saveErr);
+    }
     setConversations((prev) => [newConv, ...prev]);
     setActiveConvId(newConv.id);
     setActiveConv(newConv);
@@ -253,7 +333,7 @@ export const Workspace: React.FC<WorkspaceProps> = ({
     e.stopPropagation();
     try {
       const msgs = await getMessagesByConversation(conv.id);
-      await deleteConversation(conv.id);
+      await deleteCloudConversation(conv.id);
       setConversations((prev) => prev.filter((c) => c.id !== conv.id));
 
       if (activeConvId === conv.id) {
@@ -309,8 +389,11 @@ export const Workspace: React.FC<WorkspaceProps> = ({
         scope: currentScope,
         createdAt: Date.now(),
         updatedAt: Date.now(),
+        userId: user?.uid,
       };
-      await saveConversation(newConv);
+      await saveCloudConversation(newConv).catch((err) => {
+        console.warn('Failed to persist conversation to cloud:', err);
+      });
       setConversations((prev) => [newConv, ...prev]);
       targetConvId = newConv.id;
       targetConv = newConv;
@@ -331,7 +414,10 @@ export const Workspace: React.FC<WorkspaceProps> = ({
 
     const nextMessages = [...messages, userMsg];
     setMessages(nextMessages);
-    await saveMessage(userMsg);
+    await saveCloudMessage(targetConvId, userMsg).catch((err) => {
+      console.warn('Failed to persist user message to cloud:', err);
+      showToast({ message: 'Saved locally; cloud sync failed. Retrying in background...', type: 'info' });
+    });
     setInputQuery('');
     setIsSubmitting(true);
     setIsStreaming(false);
@@ -346,9 +432,10 @@ export const Workspace: React.FC<WorkspaceProps> = ({
         ...targetConv,
         title: newTitle,
         updatedAt: Date.now(),
+        userId: user?.uid,
       };
       setActiveConv(updatedConv);
-      await saveConversation(updatedConv);
+      await saveCloudConversation(updatedConv).catch(() => {});
       setConversations((prev) =>
         prev.map((c) => (c.id === updatedConv.id ? updatedConv : c))
       );
@@ -395,7 +482,9 @@ export const Workspace: React.FC<WorkspaceProps> = ({
         followupSuggestions: pipelineOutput.followupSuggestions,
       };
 
-      await saveMessage(assistantMsg);
+      await saveCloudMessage(targetConvId, assistantMsg).catch((err) => {
+        console.warn('Failed to persist assistant message to cloud:', err);
+      });
       setMessages([...nextMessages, assistantMsg]);
     } catch (err: any) {
       if (err.name === 'AbortError' || err.message?.includes('aborted')) {
@@ -423,7 +512,7 @@ export const Workspace: React.FC<WorkspaceProps> = ({
           retrievalScope: currentScope,
         };
 
-        await saveMessage(errorMsg);
+        await saveCloudMessage(targetConvId, errorMsg).catch(() => {});
         setMessages([...nextMessages, errorMsg]);
       }
     } finally {
@@ -491,6 +580,7 @@ export const Workspace: React.FC<WorkspaceProps> = ({
     setActiveCitation(null); // No citation highlight
     const rememberedPage = lastPagePerDoc.current[docId] || 1;
     await loadDocForViewer(docId, rememberedPage);
+    setCurrentScope({ type: 'selected', documentIds: [docId] });
     setDeskOpen(true);
   };
 
@@ -499,6 +589,7 @@ export const Workspace: React.FC<WorkspaceProps> = ({
     setActiveCitation(null); // No citation highlight
     const rememberedPage = lastPagePerDoc.current[docId] || 1;
     await loadDocForViewer(docId, rememberedPage);
+    setCurrentScope({ type: 'selected', documentIds: [docId] });
     setDeskOpen(true);
   };
 
@@ -593,7 +684,7 @@ export const Workspace: React.FC<WorkspaceProps> = ({
               setCurrentScope(scope);
               if (activeConv) {
                 const updated = { ...activeConv, scope };
-                saveConversation(updated);
+                saveCloudConversation(updated).catch(() => {});
                 setActiveConv(updated);
               }
             }}

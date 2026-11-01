@@ -144,7 +144,7 @@ describe('Phase 5: End-to-End Document Storage & Lifecycle Integration (e2eDocum
     expect(uploadRes.body.success).toBe(true);
     expect(uploadRes.body.document).toBeDefined();
     expect(uploadRes.body.document.ownerId).toBe('valid-user-a');
-    expect(uploadRes.body.document.storagePath).toMatch(/^valid-user-a\/doc_\d+_[a-f0-9]+\.pdf$/);
+    expect(uploadRes.body.document.storagePath).toMatch(/^users\/valid-user-a\/doc_\d+_[a-f0-9]+\/research_paper\.pdf$/);
 
     docId = uploadRes.body.document.id;
     storagePath = uploadRes.body.document.storagePath;
@@ -202,7 +202,7 @@ describe('Phase 5: End-to-End Document Storage & Lifecycle Integration (e2eDocum
     expect(deleteRes.body.success).toBe(true);
 
     // Verify storage removal was triggered with correct path
-    expect(mockStorageRemove).toHaveBeenCalledWith([storagePath]);
+    expect(mockStorageRemove).toHaveBeenCalledWith(expect.arrayContaining([storagePath]));
 
     // Verify subsequent retrieval returns 404
     const getAfterDelete = await request(app)

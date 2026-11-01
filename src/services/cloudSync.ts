@@ -12,6 +12,9 @@ import {
   getDocumentBlob,
   saveDocumentBlob,
   getAllConversations,
+  saveConversation,
+  deleteConversation,
+  saveMessage,
   getAllNotebookItems,
   getAllChunks,
   getChunksByDocument,
@@ -50,25 +53,51 @@ export async function syncDocumentRecordToCloud(
   docRecord: DocumentRecord,
   storagePath?: string
 ): Promise<void> {
-  if (!db) return;
-  const docRef = doc(db, `users/${uid}/documents/${docRecord.id}`);
-  await setDoc(
-    docRef,
-    {
-      name: docRecord.name,
-      pages: docRecord.pageCount,
-      size: docRecord.size,
-      hash: docRecord.fileHash || '',
-      status: docRecord.status.toLowerCase(),
-      summary: docRecord.summary || '',
-      topics: docRecord.topics || [],
-      storagePath: storagePath || `users/${uid}/pdfs/${docRecord.id}.pdf`,
-      ownerId: uid,
-      createdAt: new Date(docRecord.uploadedAt).toISOString(),
-      updatedAt: new Date(docRecord.uploadedAt).toISOString(),
-    },
-    { merge: true }
-  );
+  const patchPayload = {
+    name: docRecord.name,
+    pages: docRecord.pageCount,
+    status: docRecord.status.toLowerCase(),
+    summary: docRecord.summary || '',
+    topics: docRecord.topics || [],
+    collectionId: docRecord.collectionId || undefined,
+  };
+
+  // 1. Update via authenticated backend API
+  try {
+    const patchRes = await authFetch(`/api/documents/${docRecord.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patchPayload),
+    });
+    if (!patchRes.ok) {
+      const errText = await patchRes.text().catch(() => '');
+      console.warn(`Backend PATCH /api/documents/${docRecord.id} failed (${patchRes.status}):`, errText);
+    }
+  } catch (err) {
+    console.warn(`Backend PATCH /api/documents/${docRecord.id} skipped:`, err);
+  }
+
+  // 2. Direct client Firestore sync if initialized
+  if (db) {
+    try {
+      const docRef = doc(db, `users/${uid}/documents/${docRecord.id}`);
+      await setDoc(
+        docRef,
+        {
+          name: docRecord.name,
+          pages: docRecord.pageCount,
+          status: docRecord.status.toLowerCase(),
+          summary: docRecord.summary || '',
+          topics: docRecord.topics || [],
+          updatedAt: new Date().toISOString(),
+          ...(docRecord.collectionId ? { collectionId: docRecord.collectionId } : {}),
+        },
+        { merge: true }
+      );
+    } catch (err) {
+      console.warn(`Client Firestore setDoc for doc ${docRecord.id} skipped:`, err);
+    }
+  }
 }
 
 /**
@@ -300,6 +329,7 @@ export function normalizeCloudDocument(doc: any): DocumentRecord {
     modelUsed: doc.modelUsed || 'gemini-embedding-2-preview',
     hasExtractableText: doc.hasExtractableText !== false,
     hasOCR: !!doc.hasOCR,
+    storageBucket: doc.storageBucket || undefined,
     storagePath: doc.storagePath || undefined,
     userId: doc.userId || doc.ownerId || undefined,
     ownerId: doc.ownerId || doc.userId || undefined,
@@ -311,34 +341,220 @@ export function normalizeCloudDocument(doc: any): DocumentRecord {
 
 /**
  * Fetches user-scoped document metadata records from backend /api/documents.
+ * Returns null if the request failed (distinguishing network/server error from empty list).
  */
-export async function fetchCloudDocuments(): Promise<DocumentRecord[]> {
+export async function fetchCloudDocuments(): Promise<DocumentRecord[] | null> {
   try {
     const res = await authFetch('/api/documents');
     if (!res.ok) {
-      return [];
+      console.warn(`fetchCloudDocuments returned status: ${res.status}`);
+      return null;
     }
     const data = await res.json();
     return Array.isArray(data.documents) ? data.documents.map(normalizeCloudDocument) : [];
   } catch (err) {
     console.warn('Failed to fetch cloud documents:', err);
+    return null;
+  }
+}
+
+/**
+ * Fetches user-scoped conversation records from backend /api/conversations.
+ * Caches retrieved conversations into IndexedDB for offline resilience.
+ * Returns null if the request failed (distinguishing network/server error from empty list).
+ */
+export async function fetchCloudConversations(): Promise<ConversationRecord[] | null> {
+  try {
+    const res = await authFetch('/api/conversations');
+    if (!res.ok) {
+      console.warn(`fetchCloudConversations returned status: ${res.status}`);
+      return null;
+    }
+    const data = await res.json();
+    if (!Array.isArray(data.conversations)) {
+      return [];
+    }
+    const convs: ConversationRecord[] = data.conversations.map((c: any) => ({
+      id: String(c.id),
+      title: String(c.title || 'Untitled Inquiry'),
+      createdAt: typeof c.createdAt === 'number' ? c.createdAt : (c.createdAt ? new Date(c.createdAt).getTime() : Date.now()),
+      updatedAt: typeof c.updatedAt === 'number' ? c.updatedAt : (c.updatedAt ? new Date(c.updatedAt).getTime() : Date.now()),
+      scope: c.scope || { type: 'all' },
+      userId: c.userId || c.ownerId || undefined,
+    }));
+
+    // Cache into local IndexedDB
+    for (const conv of convs) {
+      await saveConversation(conv).catch(() => {});
+    }
+
+    return convs;
+  } catch (err) {
+    console.warn('Failed to fetch cloud conversations:', err);
+    return null;
+  }
+}
+
+/**
+ * Fetches messages for a conversation from backend /api/conversations/:id/messages.
+ * Caches retrieved messages into IndexedDB.
+ */
+export async function fetchCloudMessages(convId: string): Promise<any[]> {
+  try {
+    const res = await authFetch(`/api/conversations/${convId}/messages`);
+    if (!res.ok) {
+      return [];
+    }
+    const data = await res.json();
+    if (!Array.isArray(data.messages)) {
+      return [];
+    }
+
+    const messages = data.messages.map((m: any) => ({
+      id: String(m.id),
+      conversationId: convId,
+      role: m.role || 'user',
+      content: String(m.content || ''),
+      createdAt: typeof m.createdAt === 'number' ? m.createdAt : (m.createdAt ? new Date(m.createdAt).getTime() : Date.now()),
+      status: m.status || 'answered',
+      citations: Array.isArray(m.citations) ? m.citations : [],
+      retrievalScope: m.retrievalScope || { type: 'all' },
+      latencyMs: m.latencyMs,
+      followupSuggestions: Array.isArray(m.followupSuggestions) ? m.followupSuggestions : undefined,
+    }));
+
+    // Cache into local IndexedDB
+    for (const msg of messages) {
+      await saveMessage(msg).catch(() => {});
+    }
+
+    return messages;
+  } catch (err) {
+    console.warn(`Failed to fetch cloud messages for conversation ${convId}:`, err);
     return [];
   }
 }
 
 /**
+ * Saves a conversation both locally in IndexedDB and in the cloud via /api/conversations.
+ */
+export async function saveCloudConversation(conv: ConversationRecord): Promise<void> {
+  // 1. Save locally in IndexedDB for immediate responsiveness
+  await saveConversation(conv);
+
+  // 2. If authenticated, persist to cloud
+  const currentUser = auth?.currentUser;
+  if (currentUser && !currentUser.isAnonymous) {
+    try {
+      const res = await authFetch('/api/conversations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: conv.id,
+          title: conv.title,
+          scope: conv.scope,
+          createdAt: conv.createdAt,
+          updatedAt: conv.updatedAt,
+        }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || `Server returned ${res.status}`);
+      }
+    } catch (err) {
+      console.warn(`Failed to persist conversation ${conv.id} to cloud:`, err);
+      throw err;
+    }
+  }
+}
+
+/**
+ * Saves a message both locally in IndexedDB and in the cloud via /api/conversations/:id/messages.
+ */
+export async function saveCloudMessage(convId: string, msg: any): Promise<void> {
+  // 1. Save locally in IndexedDB
+  await saveMessage(msg);
+
+  // 2. If authenticated, persist to cloud
+  const currentUser = auth?.currentUser;
+  if (currentUser && !currentUser.isAnonymous) {
+    try {
+      const res = await authFetch(`/api/conversations/${convId}/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: msg.id,
+          role: msg.role,
+          content: msg.content,
+          status: msg.status,
+          citations: msg.citations || [],
+          latencyMs: msg.latencyMs?.total,
+          modelUsed: msg.modelUsed || 'gemini-3.8-flash',
+          createdAt: msg.createdAt,
+        }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || `Server returned ${res.status}`);
+      }
+    } catch (err) {
+      console.warn(`Failed to persist message ${msg.id} to cloud:`, err);
+      throw err;
+    }
+  }
+}
+
+/**
+ * Deletes a conversation locally and in the cloud.
+ */
+export async function deleteCloudConversation(convId: string): Promise<void> {
+  await deleteConversation(convId);
+
+  const currentUser = auth?.currentUser;
+  if (currentUser && !currentUser.isAnonymous) {
+    try {
+      await authFetch(`/api/conversations/${convId}`, {
+        method: 'DELETE',
+      });
+    } catch (err) {
+      console.warn(`Failed to delete conversation ${convId} from cloud:`, err);
+    }
+  }
+}
+
+/**
  * Deletes a document record and its Supabase Storage object via /api/documents/:id.
+ * Rejects deletion if offline to prevent partial state or resurrection on sync.
  */
 export async function deleteCloudDocument(docId: string): Promise<boolean> {
-  try {
-    const res = await authFetch(`/api/documents/${docId}`, {
-      method: 'DELETE',
-    });
-    return res.ok;
-  } catch (err) {
-    console.warn(`Failed to delete cloud document ${docId}:`, err);
-    return false;
+  if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    throw new Error('Cannot delete cloud document while offline. Please reconnect to the internet and try again.');
   }
+
+  const res = await authFetch(`/api/documents/${docId}`, {
+    method: 'DELETE',
+  });
+
+  if (!res.ok) {
+    // If the server returns 404 (Document not found), the document is already absent
+    // from the cloud or was only stored locally in the browser. Treat as idempotent success.
+    if (res.status === 404) {
+      return true;
+    }
+
+    let errMsg = `Failed to delete cloud document (${res.status})`;
+    try {
+      const data = await res.json();
+      if (data?.error) {
+        errMsg = data.error;
+      }
+    } catch {
+      // ignore json parse error
+    }
+    throw new Error(errMsg);
+  }
+
+  return true;
 }
 
 /**

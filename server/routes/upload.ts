@@ -139,27 +139,27 @@ uploadRouter.post(
         const user = req.user!;
         const uid = user.uid!;
         const docId = `doc_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
-        const storagePath = `${uid}/${docId}.pdf`;
+        const sanitizedName = sanitizeFilename(file.originalname);
+        const storagePath = `users/${uid}/${docId}/${sanitizedName}`;
         const bucket = getSupabaseBucket();
         const fileHash = crypto.createHash('sha256').update(file.buffer).digest('hex');
-        const sanitizedName = sanitizeFilename(file.originalname);
 
         // 7. Upload actual PDF buffer to private Supabase Storage bucket
         const supabase = getSupabaseAdminClient();
-        const { error: storageErr } = await supabase.storage
+        const { data: uploadResult, error: storageErr } = await supabase.storage
           .from(bucket)
           .upload(storagePath, file.buffer, {
             contentType: 'application/pdf',
             upsert: false,
           });
 
-        if (storageErr) {
+        if (storageErr || !uploadResult) {
           logger.error(
-            { err: storageErr.message, storagePath, bucket, requestId },
+            { err: storageErr?.message, storagePath, bucket, requestId },
             'Supabase Storage upload failed'
           );
           return res.status(500).json({
-            error: `Storage upload failed: ${storageErr.message}`,
+            error: `Storage upload failed: ${storageErr?.message || 'Upload returned empty result'}`,
             code: 'STORAGE_UPLOAD_FAILED',
             requestId,
           });
@@ -176,6 +176,7 @@ uploadRouter.post(
           createdAt: nowIso,
           updatedAt: nowIso,
           hash: fileHash,
+          storageBucket: bucket,
           storagePath,
           ownerId: uid,
           collectionId: req.body?.collectionId ? String(req.body.collectionId).slice(0, 128) : undefined,
@@ -193,6 +194,7 @@ uploadRouter.post(
               createdAt: docRecord.createdAt,
               updatedAt: docRecord.updatedAt,
               hash: docRecord.hash,
+              storageBucket: docRecord.storageBucket,
               storagePath: docRecord.storagePath,
               ownerId: uid,
               ...(docRecord.collectionId ? { collectionId: docRecord.collectionId } : {}),

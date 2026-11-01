@@ -16,7 +16,16 @@ export function useReveal() {
 
     const observeReveals = () => {
       document.querySelectorAll('.reveal:not(.visible)').forEach((el) => {
-        observer.observe(el);
+        try {
+          const rect = el.getBoundingClientRect();
+          if (rect.top < window.innerHeight && rect.bottom > 0) {
+            el.classList.add('visible');
+          } else {
+            observer.observe(el);
+          }
+        } catch {
+          observer.observe(el);
+        }
       });
     };
 
@@ -43,11 +52,16 @@ export function useReveal() {
 
     window.addEventListener('mousemove', handleMouseMove, { passive: true });
 
-    // Re-observe on DOM changes to support dynamic routing/tabs
+    // Re-observe on DOM changes to support dynamic routing/tabs and attribute mutations
     const mutationObserver = new MutationObserver(() => {
       observeReveals();
     });
-    mutationObserver.observe(document.body, { childList: true, subtree: true });
+    mutationObserver.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['class'],
+    });
 
     return () => {
       observer.disconnect();
